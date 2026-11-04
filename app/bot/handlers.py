@@ -186,7 +186,7 @@ def setup_routers(db: Database, voe_client: VOEDataClient) -> Router:
             address_str=loc.display_address,
             now=now,
         )
-        img_bytes = render_schedule_image(sched)
+        img_bytes = render_schedule_image(sched, now=now)
         kb = schedule_view_actions_kb(loc.id, day_tag)
 
         if img_bytes and len(text) <= 1000:

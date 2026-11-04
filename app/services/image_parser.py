@@ -4,10 +4,11 @@ import io
 import logging
 import struct
 import zlib
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Optional
 
+from app.config import settings
 from app.models import DaySchedule, SlotState
 from app.services.formatter import MONTHS_UA, WEEKDAYS_UA, format_minutes_human
 
@@ -161,21 +162,30 @@ def parse_voe_schedule_image(
 
 
 def render_schedule_image(
-    schedule: DaySchedule, scale: int = 2
+    schedule: DaySchedule,
+    scale: int = 2,
+    now: Optional[datetime] = None,
 ) -> Optional[bytes]:
     """
-    Генерує картку графіка відключень за дизайном «Графік відключень · Modern Light» (pen.dev Node ID: dXGMR).
+    Генерує картку графіка відключень за дизайном «Графік відключень · Modern Light» (pen.dev Node IDs: dXGMR / pCEiy).
     Рендерить у підвищеній роздільній здатності (scale=2 -> 1200x1732) для ідеальної чіткості у Telegram.
+    Поточна година (якщо дата графіка = сьогодні) виділяється кораловою рамкою #FF8D7D (strokeWidth=3).
     """
     if not HAS_PIL:
         return None
+
+    if now is None:
+        now = datetime.now(settings.tz)
+    current_hour: Optional[int] = (
+        now.hour if now.date() == schedule.schedule_date else None
+    )
 
     s = scale
     w, h = 600 * s, 866 * s
     im = Image.new("RGB", (w, h), (255, 255, 255))
     draw = ImageDraw.Draw(im)
 
-    # Кольорова палітра з дизайну dXGMR
+    # Кольорова палітра з дизайну dXGMR / pCEiy
     c_text_primary = (21, 35, 56)       # #152338
     c_text_secondary = (82, 97, 118)    # #526176
     c_text_muted = (101, 114, 134)      # #657286
@@ -187,6 +197,7 @@ def render_schedule_image(
     c_badge_bg = (237, 243, 255)        # #EDF3FF (Фон бейджа черги)
     c_yellow_poss = (255, 202, 58)      # #FFCA3A (Заплановане відключення)
     c_gray_on = (241, 244, 248)         # #F1F4F8 (Зі світлом)
+    c_coral_border = (255, 141, 125)    # #FF8D7D (Поточна година)
 
     # Шрифти з точними вагами з дизайну dXGMR
     font_category = _get_font("Inter", 13 * s, "SemiBold")
@@ -329,11 +340,17 @@ def render_schedule_image(
             hour = row_idx * 4 + col_idx
             s1, s2 = schedule.hour_state(hour)
 
+            is_current = current_hour == hour
+            border_color = c_coral_border if is_current else None
+            border_width = 3 * s if is_current else 0
+
             if s1 == s2:
                 draw.rounded_rectangle(
                     [cx0, cy0, cx1, cy1],
                     radius=cell_radius,
                     fill=state_fill(s1),
+                    outline=border_color,
+                    width=border_width,
                 )
             else:
                 # Якщо півгодини мають різний статус — малюємо заокруглену клітинку з двома половинами
@@ -344,6 +361,13 @@ def render_schedule_image(
                     state_fill(s1),
                     state_fill(s2),
                 )
+                if is_current:
+                    draw.rounded_rectangle(
+                        [cx0, cy0, cx1, cy1],
+                        radius=cell_radius,
+                        outline=c_coral_border,
+                        width=border_width,
+                    )
 
             # Визначаємо колір і жирність тексту години
             if s1 == SlotState.OFF or s2 == SlotState.OFF:

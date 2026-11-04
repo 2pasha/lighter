@@ -141,7 +141,7 @@ class NotificationEngine:
         schedule: DaySchedule,
         now: datetime,
     ) -> None:
-        img_bytes = render_schedule_image(schedule)
+        img_bytes = render_schedule_image(schedule, now=now)
         alert_key = f"tomorrow_new:{schedule.schedule_date.isoformat()}:{schedule.content_hash}"
 
         for user, loc in subs:
@@ -171,7 +171,7 @@ class NotificationEngine:
         if not has_meaningful_outage_changes(old_sched, new_sched, now=now):
             return
 
-        img_bytes = render_schedule_image(new_sched)
+        img_bytes = render_schedule_image(new_sched, now=now)
         alert_key = f"changed:{new_sched.schedule_date.isoformat()}:{new_sched.content_hash}"
         diff_block = format_schedule_diff(old_sched, new_sched, now=now)
         day_word = "сьогодні" if new_sched.schedule_date == now.date() else "завтра"
