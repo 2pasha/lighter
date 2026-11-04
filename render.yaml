@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: svitlo-bot-voe
+    runtime: docker
+    plan: free
+    healthCheckPath: /
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: SUPABASE_URL
+        value: https://wgegdxblmurnywmuzxbz.supabase.co
+      - key: SUPABASE_KEY
+        sync: false
+      - key: TIMEZONE
+        value: Europe/Kyiv
+      - key: POLL_INTERVAL_MINUTES
+        value: "5"
+      - key: PORT
+        value: "8080"

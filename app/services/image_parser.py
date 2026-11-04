@@ -1,0 +1,497 @@
+from __future__ import annotations
+
+import io
+import logging
+import struct
+import zlib
+from datetime import date
+from pathlib import Path
+from typing import Optional
+
+from app.models import DaySchedule, SlotState
+from app.services.formatter import MONTHS_UA, WEEKDAYS_UA, format_minutes_human
+
+logger = logging.getLogger(__name__)
+
+try:
+    from PIL import Image, ImageDraw, ImageFont
+
+    HAS_PIL = True
+except ImportError:
+    HAS_PIL = False
+
+FONTS_DIR = Path(__file__).resolve().parent.parent / "assets" / "fonts"
+
+
+def classify_rgb(r: int, g: int, b: int) -> SlotState:
+    """
+    Класифікує колір пікселя клітинки офіційного зображення @pat_voe_bot:
+    - Блакитний / синій ~ RGB(1, 176, 241) або RGB(20, 86, 216): підтверджене відключення (SlotState.OFF)
+    - Жовтий / помаранчевий ~ RGB(255, 192, 0) або RGB(255, 202, 58): заплановане відключення (SlotState.POSSIBLE_OFF)
+    - Білий / сірий ~ RGB(255, 255, 255) або RGB(241, 244, 248): світло є (SlotState.ON)
+    """
+    if b > 170 and r < 100 and g > 60:
+        return SlotState.OFF
+    if r > 200 and 120 < g < 235 and b < 90:
+        return SlotState.POSSIBLE_OFF
+    if r > 200 and g < 90 and b < 90:
+        return SlotState.OFF
+    return SlotState.ON
+
+
+def _decode_png_pure_python(
+    data: bytes,
+) -> tuple[int, int, list[list[tuple[int, int, int]]]]:
+    """Чистий Python декодер PNG (працює навіть без встановленого Pillow)."""
+    if data[:8] != b"\x89PNG\r\n\x1a\n":
+        raise ValueError("Not a valid PNG file")
+
+    pos = 8
+    chunks: list[tuple[bytes, bytes]] = []
+    while pos < len(data):
+        length = struct.unpack(">I", data[pos : pos + 4])[0]
+        ctype = data[pos + 4 : pos + 8]
+        cdata = data[pos + 8 : pos + 8 + length]
+        pos += 12 + length
+        chunks.append((ctype, cdata))
+
+    ihdr = [c for t, c in chunks if t == b"IHDR"][0]
+    w, h, bit_depth, color_type, comp, filt, interlace = struct.unpack(
+        ">IIBBBBB", ihdr
+    )
+    if color_type not in (2, 6):
+        raise ValueError(f"Unsupported PNG color_type={color_type}")
+
+    idat = b"".join(c for t, c in chunks if t == b"IDAT")
+    raw = zlib.decompress(idat)
+    bpp = 3 if color_type == 2 else 4
+    stride = w * bpp
+    pixels: list[list[tuple[int, int, int]]] = [[(255, 255, 255)] * w for _ in range(h)]
+    prev_row = [0] * stride
+    idx = 0
+
+    for y in range(h):
+        ftype = raw[idx]
+        idx += 1
+        row = list(raw[idx : idx + stride])
+        idx += stride
+        if ftype == 1:
+            for i in range(bpp, stride):
+                row[i] = (row[i] + row[i - bpp]) & 0xFF
+        elif ftype == 2:
+            for i in range(stride):
+                row[i] = (row[i] + prev_row[i]) & 0xFF
+        elif ftype == 3:
+            for i in range(stride):
+                a = row[i - bpp] if i >= bpp else 0
+                b_val = prev_row[i]
+                row[i] = (row[i] + ((a + b_val) >> 1)) & 0xFF
+        elif ftype == 4:
+            for i in range(stride):
+                a = row[i - bpp] if i >= bpp else 0
+                b_val = prev_row[i]
+                c = prev_row[i - bpp] if i >= bpp else 0
+                p = a + b_val - c
+                pa, pb, pc = abs(p - a), abs(p - b_val), abs(p - c)
+                pr = a if (pa <= pb and pa <= pc) else (b_val if pb <= pc else c)
+                row[i] = (row[i] + pr) & 0xFF
+        prev_row = row
+        for x in range(w):
+            pixels[y][x] = (row[x * bpp], row[x * bpp + 1], row[x * bpp + 2])
+
+    return w, h, pixels
+
+
+def parse_voe_schedule_image(
+    image_bytes: bytes,
+    queue: str = "1.1",
+    schedule_date: Optional[date] = None,
+) -> DaySchedule:
+    """
+    Розпізнає зображення графіка з офіційного бота @pat_voe_bot (сітка 6 рядків × 4 стовпчики = 24 години).
+    Підтримує як цілі годинні клітинки, так і поділені навпіл (по 30 хвилин).
+    """
+    target_date = schedule_date or date.today()
+
+    if HAS_PIL:
+        im = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        w, h = im.size
+
+        def get_px(x: int, y: int) -> tuple[int, int, int]:
+            return im.getpixel((x, y))  # type: ignore
+    else:
+        w, h, px_grid = _decode_png_pure_python(image_bytes)
+
+        def get_px(x: int, y: int) -> tuple[int, int, int]:
+            return px_grid[y][x]
+
+    grid_x0 = int(w * (29.0 / 540.0))
+    grid_x1 = int(w * (510.0 / 540.0))
+    grid_y0 = int(h * (140.0 / 714.0))
+    grid_y1 = int(h * (557.0 / 714.0))
+
+    col_w = (grid_x1 - grid_x0) / 4.0
+    row_h = (grid_y1 - grid_y0) / 6.0
+
+    slots: list[SlotState] = []
+
+    for row_idx in range(6):
+        sample_y = int(grid_y0 + row_idx * row_h + row_h * 0.16)
+
+        for col_idx in range(4):
+            cell_x0 = grid_x0 + col_idx * col_w
+            sample_x_left = int(cell_x0 + col_w * 0.20)
+            sample_x_right = int(cell_x0 + col_w * 0.80)
+
+            r_l, g_l, b_l = get_px(sample_x_left, sample_y)
+            r_r, g_r, b_r = get_px(sample_x_right, sample_y)
+
+            state_first_half = classify_rgb(r_l, g_l, b_l)
+            state_second_half = classify_rgb(r_r, g_r, b_r)
+
+            slots.append(state_first_half)
+            slots.append(state_second_half)
+
+    return DaySchedule(
+        queue=queue,
+        schedule_date=target_date,
+        slots=slots,
+        source="telegram_bot_image",
+    )
+
+
+def render_schedule_image(
+    schedule: DaySchedule, scale: int = 2
+) -> Optional[bytes]:
+    """
+    Генерує картку графіка відключень за дизайном «Графік відключень · Modern Light» (pen.dev Node ID: dXGMR).
+    Рендерить у підвищеній роздільній здатності (scale=2 -> 1200x1732) для ідеальної чіткості у Telegram.
+    """
+    if not HAS_PIL:
+        return None
+
+    s = scale
+    w, h = 600 * s, 866 * s
+    im = Image.new("RGB", (w, h), (255, 255, 255))
+    draw = ImageDraw.Draw(im)
+
+    # Кольорова палітра з дизайну dXGMR
+    c_text_primary = (21, 35, 56)       # #152338
+    c_text_secondary = (82, 97, 118)    # #526176
+    c_text_muted = (101, 114, 134)      # #657286
+    c_cell_text_on = (83, 97, 118)      # #536176
+    c_cell_text_poss = (61, 48, 0)      # #3D3000
+    c_white = (255, 255, 255)           # #FFFFFF
+
+    c_blue_primary = (20, 86, 216)      # #1456D8 (Відключення & Картка підсумку)
+    c_badge_bg = (237, 243, 255)        # #EDF3FF (Фон бейджа черги)
+    c_yellow_poss = (255, 202, 58)      # #FFCA3A (Заплановане відключення)
+    c_gray_on = (241, 244, 248)         # #F1F4F8 (Зі світлом)
+
+    # Шрифти з точними вагами з дизайну dXGMR
+    font_category = _get_font("Inter", 13 * s, "SemiBold")
+    font_queue_badge = _get_font("Inter", 14 * s, "SemiBold")
+    font_date_title = _get_font("Manrope", 44 * s, "Bold")
+    font_day_year = _get_font("Inter", 17 * s, "Regular")
+    font_summary_lbl = _get_font("Inter", 16 * s, "Medium")
+    font_summary_val = _get_font("Manrope", 26 * s, "Bold")
+    font_sec_title = _get_font("Manrope", 21 * s, "Bold")
+    font_sec_hint = _get_font("Inter", 13 * s, "Regular")
+    font_cell_on = _get_font("GeistMono", 18 * s, "Regular")
+    font_cell_off = _get_font("GeistMono", 18 * s, "SemiBold")
+    font_legend = _get_font("Inter", 14 * s, "Regular")
+
+    # -------------------------------------------------------------------------
+    # 1. Верхній рядок: "ГРАФІК ВІДКЛЮЧЕНЬ" (зліва) та бейдж "Черга X.Y" (справа)
+    # -------------------------------------------------------------------------
+    _draw_tracked_text(
+        draw,
+        (36 * s, int(44.5 * s)),
+        "ГРАФІК ВІДКЛЮЧЕНЬ",
+        font_category,
+        c_text_secondary,
+        letter_spacing=1.3 * s,
+    )
+
+    queue_text = f"Черга {schedule.queue}"
+    q_bbox = draw.textbbox((0, 0), queue_text, font=font_queue_badge)
+    q_tw = q_bbox[2] - q_bbox[0]
+    badge_w = q_tw + 24 * s
+    badge_h = 33 * s
+    badge_x0 = (600 - 36) * s - badge_w
+    badge_y0 = 36 * s
+    draw.rounded_rectangle(
+        [badge_x0, badge_y0, badge_x0 + badge_w, badge_y0 + badge_h],
+        radius=8 * s,
+        fill=c_badge_bg,
+    )
+    _draw_centered_text(
+        draw,
+        (badge_x0, badge_y0, badge_x0 + badge_w, badge_y0 + badge_h),
+        queue_text,
+        font_queue_badge,
+        c_blue_primary,
+    )
+
+    # -------------------------------------------------------------------------
+    # 2. Заголовок дати: "05 листопада" та "Четвер, 2026"
+    # -------------------------------------------------------------------------
+    d = schedule.schedule_date
+    month_name = MONTHS_UA.get(d.month, "")
+    weekday_name = WEEKDAYS_UA.get(d.weekday(), "")
+    date_title_str = f"{d.day:02d} {month_name}"
+    day_year_str = f"{weekday_name}, {d.year}"
+
+    _draw_tracked_text(
+        draw,
+        (36 * s, 97 * s),
+        date_title_str,
+        font_date_title,
+        c_text_primary,
+        letter_spacing=-1.2 * s,
+    )
+    draw.text(
+        (36 * s, 165 * s),
+        day_year_str,
+        fill=c_text_muted,
+        font=font_day_year,
+    )
+
+    # -------------------------------------------------------------------------
+    # 3. Синя картка підсумку: "Без світла протягом дня" -> "10 год"
+    # -------------------------------------------------------------------------
+    card_x0, card_y0 = 36 * s, 214 * s
+    card_x1, card_y1 = (36 + 528) * s, (214 + 84) * s
+    draw.rounded_rectangle(
+        [card_x0, card_y0, card_x1, card_y1],
+        radius=16 * s,
+        fill=c_blue_primary,
+    )
+
+    # Текст зліва всередині синьої картки
+    summary_lbl = "Без світла протягом дня"
+    lbl_bbox = draw.textbbox((0, 0), summary_lbl, font=font_summary_lbl)
+    lbl_h = lbl_bbox[3] - lbl_bbox[1]
+    lbl_y = card_y0 + (84 * s - lbl_h) / 2 - lbl_bbox[1]
+    draw.text((60 * s, lbl_y), summary_lbl, fill=c_white, font=font_summary_lbl)
+
+    # Сумарна тривалість справа всередині синьої картки
+    total_str = format_minutes_human(schedule.total_outage_minutes)
+    val_bbox = draw.textbbox((0, 0), total_str, font=font_summary_val)
+    val_w = val_bbox[2] - val_bbox[0]
+    val_h = val_bbox[3] - val_bbox[1]
+    val_x = (36 + 528 - 24) * s - val_w - val_bbox[0]
+    val_y = card_y0 + (84 * s - val_h) / 2 - val_bbox[1]
+    draw.text((val_x, val_y), total_str, fill=c_white, font=font_summary_val)
+
+    # -------------------------------------------------------------------------
+    # 4. Секція "Розклад на добу" + "1 блок = 1 година"
+    # -------------------------------------------------------------------------
+    draw.text(
+        (36 * s, 326 * s),
+        "Розклад на добу",
+        fill=c_text_primary,
+        font=font_sec_title,
+    )
+    hint_str = "1 блок = 1 година"
+    h_bbox = draw.textbbox((0, 0), hint_str, font=font_sec_hint)
+    h_tw = h_bbox[2] - h_bbox[0]
+    draw.text(
+        ((36 + 528) * s - h_tw, int(332.5 * s)),
+        hint_str,
+        fill=c_text_muted,
+        font=font_sec_hint,
+    )
+
+    # -------------------------------------------------------------------------
+    # 5. Сітка 24 годин (6 рядків × 4 стовпчики, клітинка 126×52, gap 8, radius 8)
+    # -------------------------------------------------------------------------
+    grid_origin_x = 36 * s
+    grid_origin_y = 371 * s
+    cell_w = 126 * s
+    cell_h = 52 * s
+    cell_gap = 8 * s
+    cell_radius = 8 * s
+
+    def state_fill(st: SlotState) -> tuple[int, int, int]:
+        if st == SlotState.OFF:
+            return c_blue_primary
+        if st == SlotState.POSSIBLE_OFF:
+            return c_yellow_poss
+        return c_gray_on
+
+    for row_idx in range(6):
+        cy0 = grid_origin_y + row_idx * (cell_h + cell_gap)
+        cy1 = cy0 + cell_h
+        for col_idx in range(4):
+            cx0 = grid_origin_x + col_idx * (cell_w + cell_gap)
+            cx1 = cx0 + cell_w
+            hour = row_idx * 4 + col_idx
+            s1, s2 = schedule.hour_state(hour)
+
+            if s1 == s2:
+                draw.rounded_rectangle(
+                    [cx0, cy0, cx1, cy1],
+                    radius=cell_radius,
+                    fill=state_fill(s1),
+                )
+            else:
+                # Якщо півгодини мають різний статус — малюємо заокруглену клітинку з двома половинами
+                _draw_split_rounded_cell(
+                    im,
+                    (cx0, cy0, cx1, cy1),
+                    cell_radius,
+                    state_fill(s1),
+                    state_fill(s2),
+                )
+
+            # Визначаємо колір і жирність тексту години
+            if s1 == SlotState.OFF or s2 == SlotState.OFF:
+                t_color = c_white if s1 == s2 else c_text_primary
+                t_font = font_cell_off
+            elif s1 == SlotState.POSSIBLE_OFF or s2 == SlotState.POSSIBLE_OFF:
+                t_color = c_cell_text_poss
+                t_font = font_cell_off
+            else:
+                t_color = c_cell_text_on
+                t_font = font_cell_on
+
+            _draw_centered_text(
+                draw, (cx0, cy0, cx1, cy1), f"{hour:02d}:00", t_font, t_color
+            )
+
+    # -------------------------------------------------------------------------
+    # 6. Умовні позначення (Легенда знизу, Y = 751)
+    # -------------------------------------------------------------------------
+    legend_items = [
+        (c_blue_primary, "Відключення"),
+        (c_yellow_poss, "Заплановане відключення"),
+        (c_gray_on, "Зі світлом"),
+    ]
+    legend_start_y = 751 * s
+    legend_row_step = 31 * s
+
+    for idx, (swatch_color, label_text) in enumerate(legend_items):
+        ly = legend_start_y + idx * legend_row_step
+        sw_y0 = ly + int(1.5 * s)
+        sw_x0 = 36 * s
+        draw.rounded_rectangle(
+            [sw_x0, sw_y0, sw_x0 + 14 * s, sw_y0 + 14 * s],
+            radius=4 * s,
+            fill=swatch_color,
+        )
+        draw.text(
+            ((36 + 24) * s, ly),
+            label_text,
+            fill=c_cell_text_on,
+            font=font_legend,
+        )
+
+    buf = io.BytesIO()
+    im.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
+
+
+def _draw_split_rounded_cell(
+    base_im: Image.Image,
+    box: tuple[int, int, int, int],
+    radius: int,
+    left_color: tuple[int, int, int],
+    right_color: tuple[int, int, int],
+) -> None:
+    x0, y0, x1, y1 = box
+    w = x1 - x0
+    h = y1 - y0
+    cell_img = Image.new("RGB", (w, h), left_color)
+    cell_draw = ImageDraw.Draw(cell_img)
+    cell_draw.rectangle([w // 2, 0, w, h], fill=right_color)
+
+    mask = Image.new("L", (w, h), 0)
+    mask_draw = ImageDraw.Draw(mask)
+    mask_draw.rounded_rectangle([0, 0, w - 1, h - 1], radius=radius, fill=255)
+    base_im.paste(cell_img, (x0, y0), mask)
+
+
+def _get_font(
+    family: str, size: int, weight_name: str = "Regular"
+) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    file_map = {
+        "Manrope": FONTS_DIR / "Manrope-Variable.ttf",
+        "Inter": FONTS_DIR / "Inter-Variable.ttf",
+        "GeistMono": FONTS_DIR / "GeistMono-Variable.ttf",
+    }
+    ttf_path = file_map.get(family)
+    if ttf_path and ttf_path.exists():
+        try:
+            f = ImageFont.truetype(str(ttf_path), size=size)
+            try:
+                f.set_variation_by_name(weight_name)
+            except Exception:
+                weight_num = {
+                    "Regular": 400,
+                    "Medium": 500,
+                    "SemiBold": 600,
+                    "Bold": 700,
+                }.get(weight_name, 400)
+                try:
+                    axes = f.get_variation_axes()
+                    if len(axes) == 2:
+                        f.set_variation_by_axes([14, weight_num])
+                    elif len(axes) == 1:
+                        f.set_variation_by_axes([weight_num])
+                except Exception:
+                    pass
+            return f
+        except Exception as exc:
+            logger.debug("Could not load bundled font %s: %s", ttf_path, exc)
+
+    # Fallback на системні шрифти
+    is_bold = weight_name in ("SemiBold", "Bold")
+    candidates = [
+        "/System/Library/Fonts/Supplemental/Arial Bold.ttf"
+        if is_bold
+        else "/System/Library/Fonts/Supplemental/Arial.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+        if is_bold
+        else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ]
+    for path in candidates:
+        try:
+            return ImageFont.truetype(path, size=size)
+        except Exception:
+            continue
+    return ImageFont.load_default()
+
+
+def _draw_centered_text(
+    draw: ImageDraw.ImageDraw,
+    box: tuple[int, int, int, int],
+    text: str,
+    font: ImageFont.FreeTypeFont | ImageFont.ImageFont,
+    fill: tuple[int, int, int],
+) -> None:
+    x0, y0, x1, y1 = box
+    bbox = draw.textbbox((0, 0), text, font=font)
+    tw = bbox[2] - bbox[0]
+    th = bbox[3] - bbox[1]
+    tx = x0 + (x1 - x0 - tw) / 2 - bbox[0]
+    ty = y0 + (y1 - y0 - th) / 2 - bbox[1]
+    draw.text((tx, ty), text, fill=fill, font=font)
+
+
+def _draw_tracked_text(
+    draw: ImageDraw.ImageDraw,
+    pos: tuple[int, int],
+    text: str,
+    font: ImageFont.FreeTypeFont | ImageFont.ImageFont,
+    fill: tuple[int, int, int],
+    letter_spacing: float = 0.0,
+) -> None:
+    if abs(letter_spacing) < 0.05:
+        draw.text(pos, text, fill=fill, font=font)
+        return
+    x, y = float(pos[0]), float(pos[1])
+    for ch in text:
+        draw.text((x, y), ch, fill=fill, font=font)
+        adv = draw.textlength(ch, font=font)
+        x += adv + letter_spacing

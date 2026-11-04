@@ -1,0 +1,11 @@
+services:
+  svitlo_bot:
+    build: .
+    container_name: svitlo_bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    ports:
+      - "${PORT:-8080}:8080"
