@@ -6,7 +6,7 @@ import struct
 import zlib
 from datetime import date, datetime
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 from app.config import settings
 from app.models import DaySchedule, SlotState
@@ -21,7 +21,9 @@ try:
 except ImportError:
     HAS_PIL = False
 
-FONTS_DIR = Path(__file__).resolve().parent.parent / "assets" / "fonts"
+ASSETS_DIR = Path(__file__).resolve().parent.parent / "assets"
+FONTS_DIR = ASSETS_DIR / "fonts"
+AVATAR_PATH = ASSETS_DIR / "bot_avatar.png"
 
 
 def classify_rgb(r: int, g: int, b: int) -> SlotState:
@@ -167,8 +169,8 @@ def render_schedule_image(
     now: Optional[datetime] = None,
 ) -> Optional[bytes]:
     """
-    Генерує картку графіка відключень за дизайном «Графік відключень · Modern Light» (pen.dev Node IDs: dXGMR / pCEiy).
-    Рендерить у підвищеній роздільній здатності (scale=2 -> 1200x1732) для ідеальної чіткості у Telegram.
+    Генерує картку графіка відключень за дизайном «Прототип · Графік з аватаром» (pen.dev Node ID: f4OWkd).
+    Рендерить у підвищеній роздільній здатності (scale=2 -> 1200x1762) для ідеальної чіткості у Telegram.
     Поточна година (якщо дата графіка = сьогодні) виділяється кораловою рамкою #FF8D7D (strokeWidth=3).
     """
     if not HAS_PIL:
@@ -181,13 +183,12 @@ def render_schedule_image(
     )
 
     s = scale
-    w, h = 600 * s, 866 * s
+    w, h = 600 * s, 881 * s
     im = Image.new("RGB", (w, h), (255, 255, 255))
     draw = ImageDraw.Draw(im)
 
-    # Кольорова палітра з дизайну dXGMR / pCEiy
-    c_text_primary = (21, 35, 56)       # #152338
-    c_text_secondary = (82, 97, 118)    # #526176
+    # Кольорова палітра з дизайну f4OWkd / pCEiy
+    c_text_primary = (32, 33, 36)       # #202124
     c_text_muted = (101, 114, 134)      # #657286
     c_cell_text_on = (83, 97, 118)      # #536176
     c_cell_text_poss = (61, 48, 0)      # #3D3000
@@ -199,8 +200,8 @@ def render_schedule_image(
     c_gray_on = (241, 244, 248)         # #F1F4F8 (Зі світлом)
     c_coral_border = (255, 141, 125)    # #FF8D7D (Поточна година)
 
-    # Шрифти з точними вагами з дизайну dXGMR
-    font_category = _get_font("Inter", 13 * s, "SemiBold")
+    # Шрифти з точними вагами з дизайну f4OWkd
+    font_category = _get_font("Inter", 12 * s, "SemiBold")
     font_queue_badge = _get_font("Inter", 14 * s, "SemiBold")
     font_date_title = _get_font("Manrope", 44 * s, "Bold")
     font_day_year = _get_font("Inter", 17 * s, "Regular")
@@ -213,15 +214,17 @@ def render_schedule_image(
     font_legend = _get_font("Inter", 14 * s, "Regular")
 
     # -------------------------------------------------------------------------
-    # 1. Верхній рядок: "ГРАФІК ВІДКЛЮЧЕНЬ" (зліва) та бейдж "Черга X.Y" (справа)
+    # 1. Верхній рядок: Аватар бота (48×48) + "ГРАФІК ВІДКЛЮЧЕНЬ" та бейдж "Черга X.Y"
     # -------------------------------------------------------------------------
+    _paste_circular_avatar(im, x=36 * s, y=36 * s, size=48 * s)
+
     _draw_tracked_text(
         draw,
-        (36 * s, int(44.5 * s)),
+        (96 * s, int(52.5 * s)),
         "ГРАФІК ВІДКЛЮЧЕНЬ",
         font_category,
-        c_text_secondary,
-        letter_spacing=1.3 * s,
+        c_text_primary,
+        letter_spacing=1.0 * s,
     )
 
     queue_text = f"Черга {schedule.queue}"
@@ -230,7 +233,7 @@ def render_schedule_image(
     badge_w = q_tw + 24 * s
     badge_h = 33 * s
     badge_x0 = (600 - 36) * s - badge_w
-    badge_y0 = 36 * s
+    badge_y0 = int(43.5 * s)
     draw.rounded_rectangle(
         [badge_x0, badge_y0, badge_x0 + badge_w, badge_y0 + badge_h],
         radius=8 * s,
@@ -255,14 +258,14 @@ def render_schedule_image(
 
     _draw_tracked_text(
         draw,
-        (36 * s, 97 * s),
+        (36 * s, 112 * s),
         date_title_str,
         font_date_title,
         c_text_primary,
-        letter_spacing=-1.2 * s,
+        letter_spacing=-1.8 * s,
     )
     draw.text(
-        (36 * s, 165 * s),
+        (36 * s, 180 * s),
         day_year_str,
         fill=c_text_muted,
         font=font_day_year,
@@ -271,8 +274,8 @@ def render_schedule_image(
     # -------------------------------------------------------------------------
     # 3. Синя картка підсумку: "Без світла протягом дня" -> "10 год"
     # -------------------------------------------------------------------------
-    card_x0, card_y0 = 36 * s, 214 * s
-    card_x1, card_y1 = (36 + 528) * s, (214 + 84) * s
+    card_x0, card_y0 = 36 * s, 229 * s
+    card_x1, card_y1 = (36 + 528) * s, (229 + 84) * s
     draw.rounded_rectangle(
         [card_x0, card_y0, card_x1, card_y1],
         radius=16 * s,
@@ -299,7 +302,7 @@ def render_schedule_image(
     # 4. Секція "Розклад на добу" + "1 блок = 1 година"
     # -------------------------------------------------------------------------
     draw.text(
-        (36 * s, 326 * s),
+        (36 * s, 341 * s),
         "Розклад на добу",
         fill=c_text_primary,
         font=font_sec_title,
@@ -308,7 +311,7 @@ def render_schedule_image(
     h_bbox = draw.textbbox((0, 0), hint_str, font=font_sec_hint)
     h_tw = h_bbox[2] - h_bbox[0]
     draw.text(
-        ((36 + 528) * s - h_tw, int(332.5 * s)),
+        ((36 + 528) * s - h_tw, int(347.5 * s)),
         hint_str,
         fill=c_text_muted,
         font=font_sec_hint,
@@ -318,7 +321,7 @@ def render_schedule_image(
     # 5. Сітка 24 годин (6 рядків × 4 стовпчики, клітинка 126×52, gap 8, radius 8)
     # -------------------------------------------------------------------------
     grid_origin_x = 36 * s
-    grid_origin_y = 371 * s
+    grid_origin_y = 386 * s
     cell_w = 126 * s
     cell_h = 52 * s
     cell_gap = 8 * s
@@ -385,14 +388,14 @@ def render_schedule_image(
             )
 
     # -------------------------------------------------------------------------
-    # 6. Умовні позначення (Легенда знизу, Y = 751)
+    # 6. Умовні позначення (Легенда знизу, Y = 766)
     # -------------------------------------------------------------------------
     legend_items = [
         (c_blue_primary, "Відключення"),
         (c_yellow_poss, "Заплановане відключення"),
         (c_gray_on, "Зі світлом"),
     ]
-    legend_start_y = 751 * s
+    legend_start_y = 766 * s
     legend_row_step = 31 * s
 
     for idx, (swatch_color, label_text) in enumerate(legend_items):
@@ -414,6 +417,209 @@ def render_schedule_image(
     buf = io.BytesIO()
     im.save(buf, format="PNG", optimize=True)
     return buf.getvalue()
+
+
+NotificationKind = Literal["light_on", "outage_soon", "schedule_updated"]
+
+
+def render_notification_image(
+    kind: NotificationKind,
+    slot_state: Optional[SlotState] = None,
+    scale: int = 2,
+) -> Optional[bytes]:
+    """
+    Генерує банер-картку сповіщення за дизайном «Прототипи · Повідомлення та аватар» (pen.dev Node ID: TGo7x).
+    Підтримує:
+    - 'light_on': синя картка (#1456D8), білий бейдж "ЗІ СВІТЛОМ", заголовок "Світло повернулось"
+    - 'outage_soon': біла картка (#FFFFFF), динамічний бейдж ("ЗАПЛАНОВАНЕ ВІДКЛЮЧЕННЯ" на #FFCA3A або
+      "ПІДТВЕРДЖЕНЕ ВІДКЛЮЧЕННЯ" на #1456D8), заголовок "Скоро відключення"
+    - 'schedule_updated': біла картка (#FFFFFF), бейдж "ОНОВЛЕННЯ" на #EDF3FF, заголовок "Графік оновлено"
+    """
+    if not HAS_PIL:
+        return None
+
+    s = scale
+    w, h = 600 * s, 208 * s
+
+    c_blue_primary = (20, 86, 216)      # #1456D8
+    c_white = (255, 255, 255)           # #FFFFFF
+    c_text_dark = (32, 33, 36)          # #202124
+    c_text_muted = (101, 114, 134)      # #657286
+    c_text_blue_sub = (220, 231, 255)   # #DCE7FF
+    c_yellow_poss = (255, 202, 58)      # #FFCA3A
+    c_text_poss = (61, 48, 0)           # #3D3000
+    c_badge_light_blue = (237, 243, 255)  # #EDF3FF
+
+    if kind == "light_on":
+        card_bg = c_blue_primary
+        badge_bg = c_white
+        badge_fg = c_blue_primary
+        badge_text = "ЗІ СВІТЛОМ"
+        title_text = "Світло повернулось"
+        title_fg = c_white
+        desc_text = "Можна повертатися до своїх справ."
+        desc_fg = c_text_blue_sub
+    elif kind == "outage_soon":
+        card_bg = c_white
+        if slot_state == SlotState.OFF:
+            badge_bg = c_blue_primary
+            badge_fg = c_white
+            badge_text = "ПІДТВЕРДЖЕНЕ ВІДКЛЮЧЕННЯ"
+        else:
+            badge_bg = c_yellow_poss
+            badge_fg = c_text_poss
+            badge_text = "ЗАПЛАНОВАНЕ ВІДКЛЮЧЕННЯ"
+        title_text = "Скоро відключення"
+        title_fg = c_text_dark
+        desc_text = "Збережіть роботу та зарядіть пристрої."
+        desc_fg = c_text_muted
+    else:
+        card_bg = c_white
+        badge_bg = c_badge_light_blue
+        badge_fg = c_blue_primary
+        badge_text = "ОНОВЛЕННЯ"
+        title_text = "Графік оновлено"
+        title_fg = c_text_dark
+        desc_text = "Перевірте розклад для своєї черги."
+        desc_fg = c_text_muted
+
+    im = Image.new("RGB", (w, h), card_bg)
+    draw = ImageDraw.Draw(im)
+
+    font_badge = _get_font("Inter", 10 * s, "Bold")
+    font_title = _get_font("Manrope", 30 * s, "Bold")
+    font_desc = _get_font("Inter", 16 * s, "Regular")
+
+    # 1. Круглий аватар бота зліва зверху (64×64, x=28, y=28)
+    _paste_circular_avatar(im, x=28 * s, y=28 * s, size=64 * s)
+
+    # 2. Бейдж типу повідомлення справа зверху (y=47, height=26, radius=6, padding=[7, 10])
+    badge_letter_spacing = 0.4 * s
+    badge_tw = _measure_tracked_text_width(draw, badge_text, font_badge, badge_letter_spacing)
+    badge_w = int(round(badge_tw + 20 * s))
+    badge_h = 26 * s
+    badge_x0 = (600 - 28) * s - badge_w
+    badge_y0 = 47 * s
+    draw.rounded_rectangle(
+        [badge_x0, badge_y0, badge_x0 + badge_w, badge_y0 + badge_h],
+        radius=6 * s,
+        fill=badge_bg,
+    )
+    b_bbox = draw.textbbox((0, 0), badge_text, font=font_badge)
+    b_th = b_bbox[3] - b_bbox[1]
+    b_ty = badge_y0 + (badge_h - b_th) / 2 - b_bbox[1]
+    b_tx = badge_x0 + (badge_w - badge_tw) / 2
+    _draw_tracked_text(
+        draw,
+        (int(round(b_tx)), int(round(b_ty))),
+        badge_text,
+        font_badge,
+        badge_fg,
+        letter_spacing=badge_letter_spacing,
+    )
+
+    # 3. Заголовок повідомлення (x=28, y=112, Manrope 30 Bold, letterSpacing=-0.8)
+    _draw_tracked_text(
+        draw,
+        (28 * s, 112 * s),
+        title_text,
+        font_title,
+        title_fg,
+        letter_spacing=-0.8 * s,
+    )
+
+    # 4. Опис повідомлення (x=28, y=161, Inter 16 Regular)
+    draw.text(
+        (28 * s, 161 * s),
+        desc_text,
+        fill=desc_fg,
+        font=font_desc,
+    )
+
+    buf = io.BytesIO()
+    im.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
+
+
+def _paste_circular_avatar(
+    base_im: Image.Image, x: int, y: int, size: int
+) -> None:
+    """Малює круглий аватар бота у заданій позиції (x, y) з розміром size×size."""
+    resample = getattr(Image, "Resampling", Image).LANCZOS
+    if AVATAR_PATH.exists():
+        try:
+            av = Image.open(AVATAR_PATH).convert("RGBA")
+            av = av.resize((size, size), resample=resample)
+        except Exception as exc:
+            logger.debug("Could not load avatar %s: %s", AVATAR_PATH, exc)
+            av = _draw_fallback_avatar(size)
+    else:
+        av = _draw_fallback_avatar(size)
+
+    # Кругла антиаліасна маска (supersampled 4x)
+    ss = 4
+    mask_large = Image.new("L", (size * ss, size * ss), 0)
+    mask_draw = ImageDraw.Draw(mask_large)
+    mask_draw.ellipse([0, 0, size * ss - 1, size * ss - 1], fill=255)
+    mask = mask_large.resize((size, size), resample=resample)
+
+    # Накладаємо на білу підкладку перед вставкою з круглою маскою
+    white_bg = Image.new("RGB", (size, size), (255, 255, 255))
+    white_bg.paste(av.convert("RGB"), (0, 0), av.split()[3] if av.mode == "RGBA" else None)
+    base_im.paste(white_bg, (x, y), mask)
+
+
+def _draw_fallback_avatar(size: int) -> Image.Image:
+    """Резервне векторне малювання маскота бота на випадок відсутності PNG-файлу."""
+    im = Image.new("RGBA", (size, size), (255, 255, 255, 255))
+    draw = ImageDraw.Draw(im)
+    black = (0, 0, 0, 255)
+    lw = max(2, int(size * 0.045))
+    # Очі
+    draw.ellipse(
+        [int(size * 0.08), int(size * 0.28), int(size * 0.42), int(size * 0.62)],
+        outline=black,
+        width=lw,
+    )
+    draw.ellipse(
+        [int(size * 0.58), int(size * 0.28), int(size * 0.92), int(size * 0.62)],
+        outline=black,
+        width=lw,
+    )
+    # Зіниці
+    draw.ellipse(
+        [int(size * 0.17), int(size * 0.40), int(size * 0.26), int(size * 0.49)],
+        fill=black,
+    )
+    draw.ellipse(
+        [int(size * 0.75), int(size * 0.40), int(size * 0.84), int(size * 0.49)],
+        fill=black,
+    )
+    # Посмішка
+    draw.arc(
+        [int(size * 0.43), int(size * 0.62), int(size * 0.57), int(size * 0.72)],
+        start=15,
+        end=165,
+        fill=black,
+        width=lw,
+    )
+    return im
+
+
+def _measure_tracked_text_width(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    font: ImageFont.FreeTypeFont | ImageFont.ImageFont,
+    letter_spacing: float = 0.0,
+) -> float:
+    if not text:
+        return 0.0
+    total = 0.0
+    for idx, ch in enumerate(text):
+        total += draw.textlength(ch, font=font)
+        if idx < len(text) - 1:
+            total += letter_spacing
+    return total
 
 
 def _draw_split_rounded_cell(

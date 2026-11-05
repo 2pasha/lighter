@@ -7,7 +7,12 @@ from zoneinfo import ZoneInfo
 
 from app.models import DaySchedule, SlotState
 from app.services.formatter import format_schedule_diff, format_schedule_message
-from app.services.image_parser import classify_rgb, parse_voe_schedule_image
+from app.services.image_parser import (
+    classify_rgb,
+    parse_voe_schedule_image,
+    render_notification_image,
+    render_schedule_image,
+)
 from app.services.notifier import NotificationEngine, is_in_quiet_hours
 
 UPLOADED_IMAGE_PATH = Path(
@@ -25,10 +30,12 @@ class TestSvitloBotCore(unittest.TestCase):
         self.assertEqual(classify_rgb(255, 255, 255), SlotState.ON)
 
     def test_parse_uploaded_pat_voe_bot_image(self) -> None:
-        if not UPLOADED_IMAGE_PATH.exists():
-            self.skipTest("Sample image not found in environment")
-
-        raw = UPLOADED_IMAGE_PATH.read_bytes()
+        try:
+            if not UPLOADED_IMAGE_PATH.exists():
+                self.skipTest("Sample image not found in environment")
+            raw = UPLOADED_IMAGE_PATH.read_bytes()
+        except PermissionError:
+            self.skipTest("Sample image not accessible in sandbox")
         sched = parse_voe_schedule_image(
             raw, queue="3.2", schedule_date=date(2026, 11, 4)
         )
@@ -187,6 +194,28 @@ class TestSvitloBotCore(unittest.TestCase):
         self.assertEqual(s.hour_state(8), (SlotState.OFF, SlotState.OFF))
         self.assertEqual(s.hour_state(12), (SlotState.OFF, SlotState.ON))
         self.assertEqual(s.hour_state(13), (SlotState.ON, SlotState.OFF))
+
+    def test_render_schedule_and_notification_images(self) -> None:
+        hourly = [SlotState.ON] * 24
+        hourly[4] = SlotState.OFF
+        hourly[12] = SlotState.POSSIBLE_OFF
+        sched = DaySchedule.from_hourly("3.2", date(2026, 11, 5), hourly)
+
+        sched_png = render_schedule_image(
+            sched, scale=2, now=datetime(2026, 11, 5, 23, 0, tzinfo=ZoneInfo("Europe/Kyiv"))
+        )
+        self.assertIsNotNone(sched_png)
+        self.assertTrue(sched_png.startswith(b"\x89PNG"))
+
+        for kind, st in (
+            ("light_on", None),
+            ("outage_soon", SlotState.POSSIBLE_OFF),
+            ("outage_soon", SlotState.OFF),
+            ("schedule_updated", None),
+        ):
+            img_bytes = render_notification_image(kind, slot_state=st, scale=2)  # type: ignore
+            self.assertIsNotNone(img_bytes)
+            self.assertTrue(img_bytes.startswith(b"\x89PNG"))
 
 
 if __name__ == "__main__":

@@ -20,7 +20,7 @@ from app.services.formatter import (
     format_schedule_message,
     has_meaningful_outage_changes,
 )
-from app.services.image_parser import render_schedule_image
+from app.services.image_parser import render_notification_image, render_schedule_image
 from app.services.voe_client import VOEDataClient
 
 logger = logging.getLogger(__name__)
@@ -345,7 +345,13 @@ class NotificationEngine:
                         f"🕒 Орієнтовно до: <b>{end_str}</b> (тривалість: {duration_str})\n\n"
                         f"<i>Рекомендуємо зарядити пристрої та завершити важливі справи за комп'ютером.</i>"
                     )
-                    await self._safe_send_message(user.telegram_id, msg)
+                    img_bytes = render_notification_image("outage_soon", slot_state=next_state)
+                    await self._safe_send_alert(
+                        user.telegram_id,
+                        msg,
+                        img_bytes=img_bytes,
+                        filename=f"warn_off_{loc.queue}_{target_time_str.replace(':', '')}.png",
+                    )
                     await self.db.mark_alert_sent(user.telegram_id, loc.id, alert_key)
 
             elif was_off and not will_be_off and user.notify_15m_on:
@@ -363,7 +369,13 @@ class NotificationEngine:
                         f"🔢 Черга: <b>{loc.queue}</b>\n"
                         f"🟢 Наступне відключення: <b>{next_off_str}</b>"
                     )
-                    await self._safe_send_message(user.telegram_id, msg)
+                    img_bytes = render_notification_image("light_on")
+                    await self._safe_send_alert(
+                        user.telegram_id,
+                        msg,
+                        img_bytes=img_bytes,
+                        filename=f"warn_on_{loc.queue}_{target_time_str.replace(':', '')}.png",
+                    )
                     await self.db.mark_alert_sent(user.telegram_id, loc.id, alert_key)
 
     @staticmethod
@@ -460,8 +472,31 @@ class NotificationEngine:
         except Exception as exc:
             logger.warning("Failed to send schedule notification to %s: %s", chat_id, exc)
 
-    async def _safe_send_message(self, chat_id: int, text: str) -> None:
+    async def _safe_send_alert(
+        self,
+        chat_id: int,
+        text: str,
+        img_bytes: Optional[bytes] = None,
+        filename: str = "alert.png",
+    ) -> None:
         try:
-            await self.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+            if img_bytes and len(text) <= 1000:
+                photo = BufferedInputFile(img_bytes, filename=filename)
+                await self.bot.send_photo(
+                    chat_id=chat_id,
+                    photo=photo,
+                    caption=text,
+                    parse_mode="HTML",
+                )
+            else:
+                if img_bytes:
+                    photo = BufferedInputFile(img_bytes, filename=filename)
+                    await self.bot.send_photo(chat_id=chat_id, photo=photo)
+                await self.bot.send_message(
+                    chat_id=chat_id, text=text, parse_mode="HTML"
+                )
         except Exception as exc:
             logger.warning("Failed to send alert message to %s: %s", chat_id, exc)
+
+    async def _safe_send_message(self, chat_id: int, text: str) -> None:
+        await self._safe_send_alert(chat_id, text)
