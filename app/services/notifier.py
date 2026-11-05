@@ -115,6 +115,15 @@ class NotificationEngine:
             if sched_date < today:
                 continue
 
+            # Ігноруємо порожні шаблони на завтра (0 хв відключень), якщо графіка в БД ще не було
+            existing_sched = await self.db.get_schedule(queue, sched_date)
+            if (
+                sched_date > today
+                and existing_sched is None
+                and new_sched.total_outage_minutes == 0
+            ):
+                continue
+
             changed, old_sched = await self.db.save_schedule(new_sched)
             if not changed:
                 continue
@@ -141,11 +150,19 @@ class NotificationEngine:
         schedule: DaySchedule,
         now: datetime,
     ) -> None:
+        if schedule.total_outage_minutes == 0:
+            return
+
         img_bytes = render_schedule_image(schedule, now=now)
         alert_key = f"tomorrow_new:{schedule.schedule_date.isoformat()}:{schedule.content_hash}"
+        now_time_str = now.strftime("%H:%M")
 
         for user, loc in subs:
             if not user.notify_tomorrow:
+                continue
+            if user.quiet_hours_enabled and is_in_quiet_hours(
+                now_time_str, user.quiet_start, user.quiet_end
+            ):
                 continue
             if await self.db.has_alert_been_sent(user.telegram_id, loc.id, alert_key):
                 continue
@@ -171,13 +188,29 @@ class NotificationEngine:
         if not has_meaningful_outage_changes(old_sched, new_sched, now=now):
             return
 
+        # Якщо в БД помилково був збережений порожній шаблон на завтра (0 хв), а тепер з'явився реальний графік —
+        # відправляємо це як "З'явився графік на завтра!", а не як "Змінився графік"
+        tomorrow = now.date() + timedelta(days=1)
+        if (
+            new_sched.schedule_date == tomorrow
+            and old_sched.total_outage_minutes == 0
+            and new_sched.total_outage_minutes > 0
+        ):
+            await self._broadcast_tomorrow_appeared(subs, new_sched, now)
+            return
+
         img_bytes = render_schedule_image(new_sched, now=now)
         alert_key = f"changed:{new_sched.schedule_date.isoformat()}:{new_sched.content_hash}"
         diff_block = format_schedule_diff(old_sched, new_sched, now=now)
         day_word = "сьогодні" if new_sched.schedule_date == now.date() else "завтра"
+        now_time_str = now.strftime("%H:%M")
 
         for user, loc in subs:
             if not user.notify_changes:
+                continue
+            if user.quiet_hours_enabled and is_in_quiet_hours(
+                now_time_str, user.quiet_start, user.quiet_end
+            ):
                 continue
             if await self.db.has_alert_been_sent(user.telegram_id, loc.id, alert_key):
                 continue

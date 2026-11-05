@@ -333,6 +333,8 @@ class VOEDataClient:
     ) -> dict[tuple[str, date], DaySchedule]:
         result: dict[tuple[str, date], DaySchedule] = {}
 
+        today = datetime.now(settings.tz).date()
+
         # Формат 1: Yasno / ha-svitlo-yeah / outage-data-ua структура:
         # {"fact": {"data": {"1762207200": {"GPV1.1": {"1": "yes", "2": "no", ...}}}}}
         fact_data = data.get("fact", {}).get("data")
@@ -349,6 +351,7 @@ class VOEDataClient:
                     except Exception:
                         continue
 
+                day_schedules: list[DaySchedule] = []
                 for raw_q_key, hours_map in queues_dict.items():
                     if not isinstance(hours_map, dict):
                         continue
@@ -356,12 +359,24 @@ class VOEDataClient:
                     if q_norm not in ALL_QUEUES:
                         continue
                     slots = cls._parse_24h_map_to_48_slots(hours_map)
-                    result[(q_norm, sched_date)] = DaySchedule(
-                        queue=q_norm,
-                        schedule_date=sched_date,
-                        slots=slots,
-                        source="voe_json",
+                    day_schedules.append(
+                        DaySchedule(
+                            queue=q_norm,
+                            schedule_date=sched_date,
+                            slots=slots,
+                            source="voe_json",
+                        )
                     )
+
+                # Якщо для майбутньої дати (завтра) всі черги мають 0 хв відключень,
+                # це порожній нічний шаблон-заглушка після 00:00 (графік ще не опубліковано)
+                if sched_date > today and all(
+                    s.total_outage_minutes == 0 for s in day_schedules
+                ):
+                    continue
+
+                for s in day_schedules:
+                    result[(s.queue, s.schedule_date)] = s
 
         # Формат 2: Прямий словник за датами або чергами
         if not result and isinstance(data, dict):

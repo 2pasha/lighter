@@ -141,18 +141,25 @@ def setup_routers(db: Database, voe_client: VOEDataClient) -> Router:
     async def _get_or_fetch_schedule(
         loc: UserLocation, target_date: date, force_refresh: bool = False
     ) -> Optional[DaySchedule]:
+        today = datetime.now(settings.tz).date()
         if not force_refresh:
             cached = await db.get_schedule(loc.queue, target_date)
             if cached:
+                if target_date > today and cached.total_outage_minutes == 0:
+                    return None
                 return cached
 
         # 1. Спробуємо завантажити з GitHub JSON дзеркала
         all_github = await voe_client.fetch_all_queues_from_github()
-        for (_, _), s in all_github.items():
+        for (_, d), s in all_github.items():
+            if d > today and s.total_outage_minutes == 0:
+                continue
             await db.save_schedule(s)
 
         if (loc.queue, target_date) in all_github:
-            return all_github[(loc.queue, target_date)]
+            cand = all_github[(loc.queue, target_date)]
+            if target_date <= today or cand.total_outage_minutes > 0:
+                return cand
 
         # 2. Якщо локація має ID адреси — опитуємо сайт voe.com.ua/disconnection/detailed
         if loc.city_id and loc.street_id and loc.house_id:
@@ -166,12 +173,19 @@ def setup_routers(db: Database, voe_client: VOEDataClient) -> Router:
             )
             if addr_res and addr_res.schedules:
                 for d, s in addr_res.schedules.items():
+                    if d > today and s.total_outage_minutes == 0:
+                        continue
                     s.queue = loc.queue
                     await db.save_schedule(s)
                 if target_date in addr_res.schedules:
-                    return addr_res.schedules[target_date]
+                    cand = addr_res.schedules[target_date]
+                    if target_date <= today or cand.total_outage_minutes > 0:
+                        return cand
 
-        return await db.get_schedule(loc.queue, target_date)
+        final_sched = await db.get_schedule(loc.queue, target_date)
+        if final_sched and target_date > today and final_sched.total_outage_minutes == 0:
+            return None
+        return final_sched
 
     async def _reply_with_schedule_card(
         message: Message,
