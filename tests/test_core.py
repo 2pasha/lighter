@@ -343,11 +343,21 @@ class TestSvitloBotCore(unittest.TestCase):
             ("Ладижин Суворова", "3.2"),
             ("Могилів-Подільський Полтавська", "3.1"),
             ("с. Побережне", "5.1"),
+            # Випадки для Порика: дедуплікація аліасів та розпізнавання сусідніх будинків
+            ("Вінниця Порика 48", "4.2"),
+            ("Порика 48", "4.2"),
+            ("Порика 50", "4.2"),
+            ("Порика 27а", "3.2"),
+            ("Порика 15", "6.2"),
+            ("Вінниця Василя Порика 3", "6.2"),
         ]
         for query, expected_queue in cases:
             res = idx.parse_and_search_freeform(query)
             self.assertTrue(res, f"No results for {query}")
             self.assertEqual(res[0]["queue"], expected_queue, f"Mismatch for {query}: {res}")
+            # Для конкретних номерів переконуємось, що немає хибних дублікатів з іншими чергами
+            if "48" in query:
+                self.assertEqual(len(res), 1, f"Expected 1 unambiguous result for {query}, got {len(res)}: {res}")
 
     def test_parse_voe_detailed_div_html(self) -> None:
         from app.services.voe_client import VOEDataClient

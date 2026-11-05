@@ -67,6 +67,15 @@ STREET_SYNONYMS = {
     "600-рiччя": "600-річчя",
 }
 
+FIRST_NAMES = {
+    "василя", "миколи", "івана", "дмитра", "олександра", "академіка", "генерала",
+    "архітектора", "гетьмана", "петра", "данила", "сергія", "лева", "левка",
+    "марка", "ігоря", "матроса", "павла", "костя", "максима", "тараса", "лесі",
+    "михайла", "григорія", "андрія", "богдана", "володимира", "ярослава", "олега",
+    "костянтина", "степана", "князів", "зої", "юрія", "ак", "в", "м", "і", "д",
+    "о", "а", "г", "п", "с", "л", "к", "б", "ю", "т", "я",
+}
+
 
 def _normalize_text(text: str) -> str:
     """Lowercase, normalize apostrophes and whitespace for fuzzy matching."""
@@ -89,7 +98,7 @@ def _strip_city_prefix(name: str) -> str:
 def _strip_street_prefix(name: str) -> str:
     s = _normalize_text(name)
     s = re.sub(
-        r"^(?:[1-9](?:-[йії])?\s+)?(?:вул\.?|вулиця|в\.|пров\.?|провулок|провул\.?|пр-т\.?|пр\.?|просп\.?|проспект|пл\.?|площа|туп\.?|тупик|тупік|проїзд|б-р|бульвар)\s*",
+        r"^(?:[1-9](?:-[йії])?\s+)?(?:вул\.?|вулиця|в\.|пров\.?|провулок|провул\.?|пр-т\.?|пр\.?|просп\.?|проспект|пл\.?|площа|туп\.?|тупик|тупік|проїзд|б-р|бульвар|шосе)\s*",
         "",
         s,
     )
@@ -101,6 +110,86 @@ def _strip_street_initials(name: str) -> str:
     s = _strip_street_prefix(name)
     s = re.sub(r"^(?:[а-яіїєґ]{1,3}\.\s*)+", "", s)
     return s.strip()
+
+
+def get_canonical_street_key(name: str) -> str:
+    """
+    Produce a canonical key for street grouping, merging name variations like
+    'вул. Порика' and 'вул. Василя Порика', or 'вул. Артинова' and 'вул. Архітектора Артинова'.
+    Preserves numbered lane types ('1-й пров' vs '2-й пров') and suburb prefixes.
+    """
+    s = _normalize_text(name)
+    s = s.replace("первозваного", "первозванного")
+    suburb_prefix = ""
+    if "," in s and s.startswith(("с.", "смт.")):
+        suburb_prefix, s = s.split(",", 1)
+        suburb_prefix = suburb_prefix.strip() + ":"
+
+    st_type = "вул"
+    for t in [
+        "1-й пров", "2-й пров", "3-й пров", "4-й пров",
+        "1-й тупик", "2-й тупик", "проїзд", "тупик", "пров",
+        "просп", "площа", "шосе", "бульвар",
+    ]:
+        if t in s:
+            st_type = t
+            break
+
+    s = re.sub(
+        r"^(?:[1-9](?:-[йії])?\s+)?(?:вул\.?|вулиця|в\.|пров\.?|провулок|провул\.?|пр-т\.?|пр\.?|просп\.?|проспект|пл\.?|площа|туп\.?|тупик|тупік|проїзд|б-р|бульвар|шосе)\s*",
+        "",
+        s,
+    )
+    words = [w.strip(" .,;:") for w in re.split(r"[\s.]+", s) if w.strip(" .,;:")]
+    remaining = [w for w in words if w not in FIRST_NAMES]
+    base = " ".join(remaining) if remaining else " ".join(words)
+    return f"{suburb_prefix}{st_type}:{base}"
+
+
+def score_house_proximity(u_num: int, spec: str) -> tuple[int, str]:
+    """
+    Check physical proximity of user house number to known numbers in a spec string.
+    Returns (proximity_score, description):
+      3 = immediate adjacent neighbor on same parity (distance == 2, e.g. 48 vs 50 or 15 vs 13)
+      2 = near neighbor on same parity (distance <= 4, e.g. 46 vs 50)
+      1 = close neighbor (distance <= 8 on same parity, or distance == 1 on opposite parity)
+      0 = far or no comparison possible
+    """
+    if not spec:
+        return 0, ""
+    best_score = 0
+    best_desc = ""
+    tokens = [t.strip() for t in re.split(r"[,;]+", spec) if t.strip()]
+    for tok in tokens:
+        tok_norm = _normalize_text(tok)
+        rm = re.match(r"^(\d+)([а-яіїєґa-z]?)-(\d+)([а-яіїєґa-z]?)$", tok_norm)
+        if rm:
+            s_n, e_n = int(rm.group(1)), int(rm.group(3))
+            for ep in (s_n, e_n):
+                if ep % 2 == u_num % 2:
+                    d = abs(ep - u_num)
+                    if d == 2 and best_score < 3:
+                        best_score, best_desc = 3, f"adjacent {ep}"
+                    elif d <= 4 and best_score < 2:
+                        best_score, best_desc = 2, f"near {ep}"
+                    elif d <= 8 and best_score < 1:
+                        best_score, best_desc = 1, f"near {ep}"
+                elif abs(ep - u_num) == 1 and best_score < 1:
+                    best_score, best_desc = 1, f"opposite {ep}"
+        else:
+            t_num, _ = _parse_house_token(tok_norm)
+            if t_num is not None:
+                if t_num % 2 == u_num % 2:
+                    d = abs(t_num - u_num)
+                    if d == 2 and best_score < 3:
+                        best_score, best_desc = 3, f"adjacent {t_num}"
+                    elif d <= 4 and best_score < 2:
+                        best_score, best_desc = 2, f"near {t_num}"
+                    elif d <= 8 and best_score < 1:
+                        best_score, best_desc = 1, f"near {t_num}"
+                elif abs(t_num - u_num) == 1 and best_score < 1:
+                    best_score, best_desc = 1, f"opposite {t_num}"
+    return best_score, best_desc
 
 
 # ---------------------------------------------------------------------------
@@ -343,11 +432,15 @@ def _parse_street_segments(text: str) -> list[tuple[str, str]]:
     """
     Parse a text block of streets & house numbers into (street_name, houses_spec) pairs.
     """
+    # Insert missing space between street letter and house digit (e.g. "Хуторянська1-29", "М.Амосова6", "пр.Юності32")
+    cleaned = re.sub(r"([а-яіїєґА-ЯІЇЄҐ]{3,})(\d)", r"\1 \2", text)
+    # Fix PDF typos like "11- ,18" -> "11-15,18" or "11,18"
+    cleaned = re.sub(r"(\d+)-\s*,", r"\1,", cleaned)
     # Collapse multi-space between street name and its house numbers
     cleaned = re.sub(
         r"([А-ЯІЇЄҐа-яіїєґ.])\s{2,}(?=\d+(?:[-/,]\d+|[а-яіїєґА-ЯІЇЄҐ]|\s*,\s*\d+|\s*$))",
         r"\1 ",
-        text,
+        cleaned,
     )
     # Also normalize "будинки №79,80" or "буд. 1-5" -> "79,80"
     cleaned = re.sub(r"\b(?:будинки|будинок|буд\.?)\s*№?\s*(?=\d)", "", cleaned, flags=re.I)
@@ -397,6 +490,73 @@ def _parse_street_segments(text: str) -> list[tuple[str, str]]:
                     elif len(sc) >= 3:
                         results.append((_clean_street_display(sc), ""))
     return results
+
+
+def merge_city_streets(city_id: str, streets: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """
+    Merge duplicate street variants in a city (e.g. 'вул. Порика' and 'вул. Василя Порика',
+    or 'вул. Артинова' and 'вул. Архітектора Артинова') into a single canonical street object.
+    Preserves aliases and merges (houses, queue) records without duplicates.
+    """
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for st in streets:
+        k = get_canonical_street_key(st["name"])
+        groups.setdefault(k, []).append(st)
+
+    merged: list[dict[str, Any]] = []
+    for s_idx, (k, st_list) in enumerate(groups.items()):
+        new_id = f"{city_id}_s_{s_idx}"
+        if len(st_list) == 1:
+            st = dict(st_list[0])
+            st["id"] = new_id
+            if "aliases" not in st:
+                st["aliases"] = []
+            merged.append(st)
+        else:
+            sorted_by_pref = sorted(
+                st_list,
+                key=lambda s: (
+                    -len(re.findall(r"\b[А-ЯІЇЄҐа-яіїєґ]{4,}\b", s["name"])),
+                    -len(s["name"]),
+                ),
+            )
+            primary = sorted_by_pref[0]
+            aliases = sorted(
+                {s["name"] for s in st_list if s["name"] != primary["name"]}
+                | {a for s in st_list for a in s.get("aliases", []) if a != primary["name"]}
+            )
+            all_records: list[dict[str, str]] = []
+            for s in st_list:
+                for r in s.get("records", []):
+                    rec = {"houses": r.get("houses", ""), "queue": r.get("queue", "")}
+                    if rec not in all_records:
+                        all_records.append(rec)
+            merged.append(
+                {
+                    "id": new_id,
+                    "name": primary["name"],
+                    "aliases": aliases,
+                    "records": all_records,
+                }
+            )
+    return merged
+
+
+def migrate_voe_addresses(data: dict[str, Any]) -> dict[str, Any]:
+    """Migrate an entire voe_addresses index to have deduplicated/canonicalized streets with aliases."""
+    new_cities: list[dict[str, Any]] = []
+    for city in data.get("cities", []):
+        c_id = city["id"]
+        old_streets = city.get("streets", [])
+        new_streets = merge_city_streets(c_id, old_streets)
+        new_city = dict(city)
+        new_city["streets"] = new_streets
+        new_cities.append(new_city)
+    return {
+        "version": data.get("version", "2026-2027"),
+        "source_url": data.get("source_url", ""),
+        "cities": new_cities,
+    }
 
 
 def build_index_from_rows(rows: list[tuple[str, str, str]]) -> dict[str, Any]:
@@ -508,15 +668,16 @@ def build_index_from_rows(rows: list[tuple[str, str, str]]) -> dict[str, Any]:
     for c_idx, c_name in enumerate(sorted_city_names):
         c_data = cities_map[c_name]
         city_id = f"c_{c_idx}"
-        streets_list: list[dict[str, Any]] = []
+        raw_streets: list[dict[str, Any]] = []
         for s_idx, (_, s_data) in enumerate(sorted(c_data["streets"].items(), key=lambda x: x[1]["name"])):
-            streets_list.append(
+            raw_streets.append(
                 {
                     "id": f"{city_id}_s_{s_idx}",
                     "name": s_data["name"],
                     "records": s_data["records"],
                 }
             )
+        streets_list = merge_city_streets(city_id, raw_streets)
         cities_list.append(
             {
                 "id": city_id,
@@ -688,6 +849,7 @@ class AddressIndex:
         q_clean = _strip_street_prefix(query)
         q_clean = STREET_SYNONYMS.get(q_clean, q_clean)
         q_no_init = _strip_street_initials(q_clean)
+        q_canon = get_canonical_street_key(query)
 
         streets = city.get("streets", [])
         if not q_clean:
@@ -705,18 +867,22 @@ class AddressIndex:
             s_clean = _strip_street_prefix(st["name"])
             s_clean = STREET_SYNONYMS.get(s_clean, s_clean)
             s_no_init = _strip_street_initials(s_clean)
+            s_canon = get_canonical_street_key(st["name"])
+            aliases_clean = [_strip_street_prefix(a) for a in st.get("aliases", [])]
 
             # Avoid matching suburb-prefixed entries in м. Вінниця when direct city street matches exist
             is_suburb_alias = "," in st["name"] and st["name"].startswith(("с.", "смт."))
             penalty = 15 if is_suburb_alias else 0
 
-            if s_clean == q_clean or s_no_init == q_no_init:
+            if q_canon and s_canon == q_canon:
                 score = 100 - penalty
-            elif s_no_init.startswith(q_no_init) or s_clean.startswith(q_clean):
+            elif s_clean == q_clean or s_no_init == q_no_init or any(a == q_clean for a in aliases_clean):
+                score = 100 - penalty
+            elif s_no_init.startswith(q_no_init) or s_clean.startswith(q_clean) or any(a.startswith(q_clean) for a in aliases_clean):
                 score = 85 - penalty
-            elif re.search(rf"(?:^|[\s.\-]){re.escape(q_no_init)}", s_clean):
+            elif re.search(rf"(?:^|[\s.\-]){re.escape(q_no_init)}", s_clean) or any(re.search(rf"(?:^|[\s.\-]){re.escape(q_no_init)}", a) for a in aliases_clean):
                 score = 75 - penalty
-            elif q_no_init in s_clean:
+            elif q_no_init in s_clean or any(q_clean in a or q_no_init in a for a in aliases_clean):
                 score = 60 - penalty
             else:
                 continue
@@ -736,6 +902,7 @@ class AddressIndex:
     def search_houses(self, street_id: str, query: str) -> list[dict[str, Any]]:
         """
         Resolve house number against a street's records and return matching options with queue codes.
+        Prefers exact/range matches, then adjacent parity neighbors, and excludes disjoint-only queues.
         """
         city, st = self.get_street(street_id)
         if not st:
@@ -743,22 +910,23 @@ class AddressIndex:
 
         q_house = query.strip()
         records = st.get("records", [])
+        u_num, u_suf = _parse_house_token(q_house)
 
-        # Score each record against the user's house number
+        # 1. Direct match in explicit house ranges (score 1..4)
         scored_queues: dict[str, tuple[int, list[str]]] = {}
         for rec in records:
             h_spec = rec.get("houses", "")
             q_code = rec.get("queue", "")
-            if not q_code:
+            if not q_code or not h_spec:
                 continue
-            score = match_house_in_spec(q_house, h_spec) if h_spec else 0
+            score = match_house_in_spec(q_house, h_spec)
             if score > 0:
                 prev_score, prev_specs = scored_queues.get(q_code, (0, []))
-                if h_spec and h_spec not in prev_specs:
+                if h_spec not in prev_specs:
                     prev_specs.append(h_spec)
                 scored_queues[q_code] = (max(prev_score, score), prev_specs)
 
-        # If exact/parity matches exist (score >= 2), prefer them over wide range matches (score == 1)
+        # If high-confidence direct match exists (score >= 3, exact number match), return only them!
         if scored_queues:
             max_score = max(s for s, _ in scored_queues.values())
             if max_score >= 3:
@@ -767,24 +935,68 @@ class AddressIndex:
                 filtered = scored_queues
 
             sorted_q = sorted(filtered.items(), key=lambda x: (-x[1][0], x[0]))
-            results: list[dict[str, Any]] = []
-            for q_code, (sc, specs) in sorted_q:
-                results.append(
-                    {
-                        "id": f"{street_id}_h_{q_house}_{q_code}",
-                        "name": f"буд. {q_house} (черга {q_code})",
-                        "house": q_house,
-                        "queue": q_code,
-                        "score": sc,
-                        "matched_ranges": specs,
-                    }
-                )
-            return results
+            return [
+                {
+                    "id": f"{street_id}_h_{q_house}_{q_code}",
+                    "name": f"буд. {q_house} (черга {q_code})",
+                    "house": q_house,
+                    "queue": q_code,
+                    "score": sc,
+                    "matched_ranges": specs,
+                }
+                for q_code, (sc, specs) in sorted_q
+            ]
 
-        # Fallback: if no specific range matched (or street only has whole-street records)
-        all_queues = sorted({r["queue"] for r in records if r.get("queue")})
-        if len(all_queues) == 1:
-            q_code = all_queues[0]
+        # 2. No direct range match: evaluate physical proximity and general coverage
+        general_queues = sorted({r["queue"] for r in records if not r.get("houses") and r.get("queue")})
+        has_any_houses = any(bool(r.get("houses")) for r in records)
+
+        prox_scores: dict[str, tuple[int, list[str]]] = {}
+        if u_num is not None:
+            for rec in records:
+                h_spec = rec.get("houses", "")
+                q_code = rec.get("queue", "")
+                if not q_code or not h_spec:
+                    continue
+                ps, p_desc = score_house_proximity(u_num, h_spec)
+                if ps > 0:
+                    prev_ps, prev_descs = prox_scores.get(q_code, (0, []))
+                    if p_desc and p_desc not in prev_descs:
+                        prev_descs.append(p_desc)
+                    prox_scores[q_code] = (max(prev_ps, ps), prev_descs)
+
+        # High proximity match (score >= 3: adjacent neighbor on same parity):
+        # Even if not directly listed, the adjacent building on the same side is in this queue!
+        if any(s >= 3 for s, _ in prox_scores.values()):
+            top_prox = {q: v for q, v in prox_scores.items() if v[0] >= 3}
+            sorted_p = sorted(top_prox.items(), key=lambda x: (-x[1][0], x[0]))
+            return [
+                {
+                    "id": f"{street_id}_h_{q_house}_{q_code}",
+                    "name": f"буд. {q_house} (черга {q_code})",
+                    "house": q_house,
+                    "queue": q_code,
+                    "score": sc,
+                    "matched_ranges": descs,
+                }
+                for q_code, (sc, descs) in sorted_p
+            ]
+
+        # Eligible fallback queues:
+        # If street has general whole-street records, only those queues are fallback eligible!
+        # Queues with strictly disjoint house lists (e.g. 6.2 on Poryka) are EXCLUDED.
+        if general_queues:
+            fallback_queues = general_queues
+        elif not has_any_houses:
+            fallback_queues = sorted({r["queue"] for r in records if r.get("queue")})
+        else:
+            # All queues had explicit house lists but none matched; include queues with proximity >= 2
+            fallback_queues = sorted([q for q, (s, _) in prox_scores.items() if s >= 2])
+            if not fallback_queues:
+                fallback_queues = sorted({r["queue"] for r in records if r.get("queue")})
+
+        if len(fallback_queues) == 1:
+            q_code = fallback_queues[0]
             return [
                 {
                     "id": f"{street_id}_h_{q_house}_{q_code}",
@@ -796,8 +1008,6 @@ class AddressIndex:
                 }
             ]
 
-        # Street spans multiple queues and house number wasn't in the explicit ranges:
-        # return candidate queues for this street so user only picks among the 2-3 queues on their street!
         return [
             {
                 "id": f"{street_id}_h_{q_house}_{q_code}",
@@ -808,10 +1018,10 @@ class AddressIndex:
                 ),
                 "house": q_house,
                 "queue": q_code,
-                "score": 0,
+                "score": prox_scores.get(q_code, (0, []))[0],
                 "matched_ranges": [r["houses"] for r in records if r["queue"] == q_code and r.get("houses")],
             }
-            for q_code in all_queues
+            for q_code in fallback_queues
         ]
 
     def parse_and_search_freeform(self, text: str, limit: int = 8) -> list[dict[str, Any]]:
@@ -965,6 +1175,12 @@ class AddressIndex:
 
             if len(results) >= limit:
                 break
+
+        if results:
+            results.sort(key=lambda r: (-r.get("score", 0), r.get("display", "")))
+            max_score = results[0].get("score", 0)
+            if max_score >= 3:
+                results = [r for r in results if r.get("score", 0) >= 3]
 
         return results[:limit]
 
