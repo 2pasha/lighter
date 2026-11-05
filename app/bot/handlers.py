@@ -21,6 +21,7 @@ from app.bot.keyboards import (
     label_presets_kb,
     locations_list_kb,
     main_reply_keyboard,
+    popular_cities_kb,
     queue_picker_kb,
     schedule_view_actions_kb,
     settings_kb,
@@ -415,45 +416,166 @@ def setup_routers(db: Database, voe_client: VOEDataClient) -> Router:
                 parse_mode="HTML",
             )
 
-    # Пошук за адресою: Крок 1 — Місто
+    # Пошук за адресою: Крок 1 — Місто або швидкий пошук одним рядком
     @router.callback_query(F.data == "addloc:method:address")
     async def cb_addloc_method_address(call: CallbackQuery, state: FSMContext) -> None:
+        popular = voe_client.get_popular_cities(limit=10)
+        await state.update_data(
+            city_candidates=[
+                {"id": c.id, "label": c.label, "queue": c.queue}
+                for c in popular
+            ]
+        )
         await state.set_state(AddLocationStates.entering_city)
         await call.answer()
         if call.message:
             await call.message.edit_text(
-                "🏙 <b>Крок 1 із 3: Населений пункт</b>\n"
-                "Введіть назву міста або села українською мовою (наприклад: <code>Вінниця</code>, <code>Жмеринка</code>, <code>Агрономічне</code>):",
+                "🏙 <b>Пошук черги за адресою</b>\n\n"
+                "1️⃣ <b>Оберіть населений пункт</b> із популярних нижче або введіть назву міста/села "
+                "(наприклад: <code>Вінниця</code>, <code>Ладижин</code>, <code>Бар</code>).\n\n"
+                "2️⃣ Або <b>напишіть одразу повну адресу</b> одним рядком "
+                "(наприклад: <code>Соборна 24</code>, <code>Вінниця Келецька 120</code>, "
+                "<code>Агрономічне Мічуріна</code>) — і я миттєво знайду вашу чергу!",
                 parse_mode="HTML",
+                reply_markup=popular_cities_kb(popular, "addloc:city"),
             )
 
     @router.message(AddLocationStates.entering_city, F.text)
     async def msg_entering_city(message: Message, state: FSMContext) -> None:
         query = (message.text or "").strip()
         if len(query) < 2:
-            await message.answer("Введіть щонайменше 2 літери назви населеного пункту:")
+            await message.answer("Введіть щонайменше 2 літери назви населеного пункту або адреси:")
             return
 
-        status_msg = await message.answer("🔍 Шукаю населений пункт у базі Вінницяобленерго...")
+        # 1. Якщо запит містить номер будинку, кому або кілька слів (вулиця + будинок) —
+        # пробуємо швидкий пошук повної адреси одним рядком
+        has_digits_or_comma = bool(re.search(r"\d|,", query))
         cities = await voe_client.search_cities(query)
+
+        if has_digits_or_comma or not cities:
+            free_matches = voe_client.search_address_freeform(query, limit=8)
+            if len(free_matches) == 1:
+                m = free_matches[0]
+                await state.update_data(
+                    city_id=m["city_id"],
+                    city_name=m["city_name"],
+                    street_id=m.get("street_id"),
+                    street_name=m.get("street_name"),
+                    house_num=m.get("house"),
+                    queue=m["queue"],
+                )
+                await state.set_state(AddLocationStates.entering_label)
+                await message.answer(
+                    f"✅ Адресу знайдено: <b>{m['display']}</b>\n"
+                    f"🔢 Ваша черга ГПВ: <b>{m['queue']}</b>\n\n"
+                    "🏷 Оберіть назву для цієї локації або напишіть свою:",
+                    parse_mode="HTML",
+                    reply_markup=label_presets_kb(),
+                )
+                return
+            elif len(free_matches) > 1:
+                items = [
+                    AutocompleteItem(
+                        id=str(idx),
+                        label=f"{m['display']} (черга {m['queue']})",
+                        queue=m["queue"],
+                    )
+                    for idx, m in enumerate(free_matches[:10])
+                ]
+                await state.update_data(freeform_candidates=free_matches[:10])
+                await state.set_state(AddLocationStates.selecting_house)
+                await message.answer(
+                    "🏠 Знайдено кілька варіантів за вашим запитом. Оберіть потрібний:",
+                    reply_markup=autocomplete_items_kb(items, "addloc:free"),
+                )
+                return
+
         if not cities:
-            await status_msg.edit_text(
-                "⚠️ На жаль, не вдалося знайти населений пункт або сайт обленерго тимчасово не відповідає.\n"
-                "Спробуйте ввести іншу назву або оберіть чергу вручну:",
+            await message.answer(
+                "⚠️ На жаль, не вдалося знайти таку адресу чи населений пункт у довіднику.\n"
+                "Спробуйте ввести лише назву міста/села або оберіть чергу вручну:",
                 reply_markup=queue_picker_kb(),
             )
             await state.set_state(AddLocationStates.choosing_queue)
             return
 
+        # Якщо знайдено рівно 1 населений пункт — переходимо одразу далі без зайвого кліку
+        if len(cities) == 1:
+            c = cities[0]
+            await _proceed_with_chosen_city(
+                message, state, {"id": c.id, "label": c.label, "queue": c.queue}, edit=False
+            )
+            return
+
         await state.update_data(
-            city_candidates=[{"id": c.id, "label": c.label} for c in cities[:10]]
+            city_candidates=[
+                {"id": c.id, "label": c.label, "queue": c.queue}
+                for c in cities[:10]
+            ]
         )
         await state.set_state(AddLocationStates.selecting_city)
-        await status_msg.edit_text(
+        await message.answer(
             "🏙 Оберіть ваш населений пункт зі списку:",
             reply_markup=autocomplete_items_kb(cities, "addloc:city"),
         )
 
+    async def _proceed_with_chosen_city(
+        msg_or_call_msg: Message,
+        state: FSMContext,
+        chosen: dict,
+        edit: bool = True,
+    ) -> None:
+        city_id = chosen["id"]
+        city_name = chosen["label"]
+        await state.update_data(city_id=city_id, city_name=city_name)
+
+        # Перевіряємо, чи має населений пункт деталізацію за вулицями в локальному індексі
+        c_obj = voe_client.address_index.get_city(city_id)
+        if c_obj and not c_obj.get("streets"):
+            c_queues = c_obj.get("queues", [])
+            if len(c_queues) == 1:
+                q_code = c_queues[0]
+                await state.update_data(queue=q_code)
+                await state.set_state(AddLocationStates.entering_label)
+                txt = (
+                    f"✅ Населений пункт: <b>{city_name}</b>\n"
+                    f"🔢 Ваша черга ГПВ: <b>{q_code}</b>\n\n"
+                    "🏷 Оберіть назву для цієї локації або напишіть свою:"
+                )
+                if edit:
+                    await msg_or_call_msg.edit_text(txt, parse_mode="HTML", reply_markup=label_presets_kb())
+                else:
+                    await msg_or_call_msg.answer(txt, parse_mode="HTML", reply_markup=label_presets_kb())
+                return
+            elif len(c_queues) > 1:
+                await state.set_state(AddLocationStates.choosing_queue)
+                txt = (
+                    f"🏘 Населений пункт: <b>{city_name}</b>\n"
+                    f"За офіційним графіком тут діють черги: <b>{', '.join(c_queues)}</b>.\n"
+                    "Оберіть вашу чергу зі списку:"
+                )
+                kb = queue_picker_kb(allowed_queues=c_queues)
+                if edit:
+                    await msg_or_call_msg.edit_text(txt, parse_mode="HTML", reply_markup=kb)
+                else:
+                    await msg_or_call_msg.answer(txt, parse_mode="HTML", reply_markup=kb)
+                return
+
+        await state.set_state(AddLocationStates.entering_street)
+        txt = (
+            f"🏙 Населений пункт: <b>{city_name}</b>\n\n"
+            "🛣 <b>Крок 2 із 3: Вулиця</b>\n"
+            "Введіть назву вулиці або одразу вулицю з номером будинку "
+            "(наприклад: <code>Соборна 24</code> або <code>Келецька</code>):"
+        )
+        if edit:
+            await msg_or_call_msg.edit_text(txt, parse_mode="HTML")
+        else:
+            await msg_or_call_msg.answer(txt, parse_mode="HTML")
+
+    @router.callback_query(
+        AddLocationStates.entering_city, F.data.startswith("addloc:city:")
+    )
     @router.callback_query(
         AddLocationStates.selecting_city, F.data.startswith("addloc:city:")
     )
@@ -468,15 +590,8 @@ def setup_routers(db: Database, voe_client: VOEDataClient) -> Router:
             return
 
         chosen = candidates[idx]
-        await state.update_data(city_id=chosen["id"], city_name=chosen["label"])
-        await state.set_state(AddLocationStates.entering_street)
         await call.answer()
-        await call.message.edit_text(
-            f"🏙 Населений пункт: <b>{chosen['label']}</b>\n\n"
-            "🛣 <b>Крок 2 із 3: Вулиця</b>\n"
-            "Введіть назву вулиці (наприклад: <code>Соборна</code>, <code>Келецька</code>):",
-            parse_mode="HTML",
-        )
+        await _proceed_with_chosen_city(call.message, state, chosen, edit=True)  # type: ignore
 
     @router.message(AddLocationStates.entering_street, F.text)
     async def msg_entering_street(message: Message, state: FSMContext) -> None:
@@ -487,23 +602,97 @@ def setup_routers(db: Database, voe_client: VOEDataClient) -> Router:
 
         data = await state.get_data()
         city_id = data.get("city_id", "")
-        status_msg = await message.answer("🔍 Шукаю вулицю...")
+        city_name = data.get("city_name", "")
+
+        # Якщо користувач ввів одразу вулицю та номер будинку (напр. "Соборна 24")
+        hm = re.search(
+            r"(?:[,\s]+(?:буд\.?|будинок|№)?\s*|\s+)(\d+[а-яіїєґА-ЯІЇЄҐa-zA-Z]?(?:/\d+[а-яіїєґА-ЯІЇЄҐa-zA-Z]?)?)$",
+            query,
+        )
+        if hm and query[: hm.start()].strip(" ,;."):
+            street_part = query[: hm.start()].strip(" ,;.")
+            house_part = hm.group(1).strip()
+            streets_with_num = await voe_client.search_streets(city_id, street_part)
+            if len(streets_with_num) == 1:
+                st = streets_with_num[0]
+                await state.update_data(street_id=st.id, street_name=st.label)
+                await _resolve_or_pick_house(message, state, st.id, st.label, house_part)
+                return
+
         streets = await voe_client.search_streets(city_id, query)
         if not streets:
-            await status_msg.edit_text(
-                "⚠️ Вулицю не знайдено. Спробуйте ввести частину назви вулиці ще раз або оберіть чергу вручну:",
-                reply_markup=queue_picker_kb(),
+            c_obj = voe_client.address_index.get_city(city_id)
+            allowed_q = c_obj.get("queues") if c_obj else None
+            await message.answer(
+                f"⚠️ Вулицю «{query}» у <b>{city_name}</b> не знайдено.\n"
+                "Спробуйте ввести іншу назву вулиці або оберіть чергу вручну:",
+                parse_mode="HTML",
+                reply_markup=queue_picker_kb(allowed_queues=allowed_q),
+            )
+            return
+
+        if len(streets) == 1:
+            st = streets[0]
+            await _proceed_with_chosen_street(
+                message, state, {"id": st.id, "label": st.label, "queue": st.queue}, edit=False
             )
             return
 
         await state.update_data(
-            street_candidates=[{"id": s.id, "label": s.label} for s in streets[:10]]
+            street_candidates=[
+                {"id": s.id, "label": s.label, "queue": s.queue}
+                for s in streets[:10]
+            ]
         )
         await state.set_state(AddLocationStates.selecting_street)
-        await status_msg.edit_text(
+        await message.answer(
             "🛣 Оберіть вулицю зі списку:",
             reply_markup=autocomplete_items_kb(streets, "addloc:street"),
         )
+
+    async def _proceed_with_chosen_street(
+        msg_or_call_msg: Message,
+        state: FSMContext,
+        chosen: dict,
+        edit: bool = True,
+    ) -> None:
+        street_id = chosen["id"]
+        street_name = chosen["label"]
+        data = await state.get_data()
+        city_name = data.get("city_name", "")
+        await state.update_data(street_id=street_id, street_name=street_name)
+
+        # Перевіряємо, чи вся вулиця належить до однієї черги без поділу за номерами будинків
+        _, st_obj = voe_client.address_index.get_street(street_id)
+        if st_obj:
+            records = st_obj.get("records", [])
+            st_queues = sorted({r["queue"] for r in records if r.get("queue")})
+            has_house_ranges = any(bool(r.get("houses")) for r in records)
+            if len(st_queues) == 1 and not has_house_ranges:
+                q_code = st_queues[0]
+                await state.update_data(queue=q_code)
+                await state.set_state(AddLocationStates.entering_label)
+                txt = (
+                    f"✅ Адресу знайдено: <b>{city_name}, {street_name}</b>\n"
+                    f"🔢 Ваша черга ГПВ: <b>{q_code}</b>\n\n"
+                    "🏷 Оберіть назву для цієї локації або напишіть свою:"
+                )
+                if edit:
+                    await msg_or_call_msg.edit_text(txt, parse_mode="HTML", reply_markup=label_presets_kb())
+                else:
+                    await msg_or_call_msg.answer(txt, parse_mode="HTML", reply_markup=label_presets_kb())
+                return
+
+        await state.set_state(AddLocationStates.entering_house)
+        txt = (
+            f"🏙 {city_name}, <b>{street_name}</b>\n\n"
+            "🏠 <b>Крок 3 із 3: Номер будинку</b>\n"
+            "Введіть номер будинку (наприклад: <code>10</code>, <code>25А</code>):"
+        )
+        if edit:
+            await msg_or_call_msg.edit_text(txt, parse_mode="HTML")
+        else:
+            await msg_or_call_msg.answer(txt, parse_mode="HTML")
 
     @router.callback_query(
         AddLocationStates.selecting_street, F.data.startswith("addloc:street:")
@@ -519,14 +708,87 @@ def setup_routers(db: Database, voe_client: VOEDataClient) -> Router:
             return
 
         chosen = candidates[idx]
-        await state.update_data(street_id=chosen["id"], street_name=chosen["label"])
-        await state.set_state(AddLocationStates.entering_house)
         await call.answer()
-        await call.message.edit_text(
-            f"🏙 {data.get('city_name')}, <b>{chosen['label']}</b>\n\n"
-            "🏠 <b>Крок 3 із 3: Номер будинку</b>\n"
-            "Введіть номер будинку (наприклад: <code>10</code>, <code>25А</code>):",
+        await _proceed_with_chosen_street(call.message, state, chosen, edit=True)  # type: ignore
+
+    async def _resolve_or_pick_house(
+        message: Message,
+        state: FSMContext,
+        street_id: str,
+        street_name: str,
+        house_query: str,
+    ) -> None:
+        data = await state.get_data()
+        city_id = data.get("city_id", "")
+        city_name = data.get("city_name", "")
+
+        # Спочатку перевіряємо кеш бази даних
+        cached_q = await db.lookup_cached_address(city_name, street_name, house_query)
+        houses = await voe_client.search_houses(street_id, house_query)
+
+        if len(houses) == 1 and houses[0].queue:
+            q_code = houses[0].queue
+            await state.update_data(
+                house_id=houses[0].id,
+                house_num=house_query,
+                queue=q_code,
+            )
+            await state.set_state(AddLocationStates.entering_label)
+            await message.answer(
+                f"✅ Адресу знайдено: <b>{city_name}, {street_name}, {house_query}</b>\n"
+                f"🔢 Ваша черга ГПВ: <b>{q_code}</b>\n\n"
+                "🏷 Оберіть назву для цієї локації або напишіть свою:",
+                parse_mode="HTML",
+                reply_markup=label_presets_kb(),
+            )
+            return
+
+        if cached_q and not houses:
+            await state.update_data(house_num=house_query, queue=cached_q)
+            await state.set_state(AddLocationStates.entering_label)
+            await message.answer(
+                f"✅ Адресу знайдено: <b>{city_name}, {street_name}, {house_query}</b>\n"
+                f"🔢 Ваша черга ГПВ: <b>{cached_q}</b>\n\n"
+                "🏷 Оберіть назву для цієї локації або напишіть свою:",
+                parse_mode="HTML",
+                reply_markup=label_presets_kb(),
+            )
+            return
+
+        if not houses:
+            _, st_obj = voe_client.address_index.get_street(street_id)
+            allowed_q = (
+                sorted({r["queue"] for r in st_obj.get("records", []) if r.get("queue")})
+                if st_obj
+                else None
+            )
+            await state.update_data(house_num=house_query)
+            await state.set_state(AddLocationStates.choosing_queue)
+            await message.answer(
+                f"📍 Адреса: <b>{city_name}, {street_name}, {house_query}</b>\n"
+                "Оберіть вашу чергу ГПВ зі списку:",
+                parse_mode="HTML",
+                reply_markup=queue_picker_kb(allowed_queues=allowed_q),
+            )
+            return
+
+        await state.update_data(
+            house_candidates=[
+                {
+                    "id": h.id,
+                    "label": h.label,
+                    "house_num": house_query,
+                    "queue": h.queue,
+                }
+                for h in houses[:10]
+            ]
+        )
+        await state.set_state(AddLocationStates.selecting_house)
+        await message.answer(
+            f"🏠 Для адреси <b>{city_name}, {street_name}, {house_query}</b> знайдено кілька приєднань.\n"
+            "Оберіть ваш варіант зі списку:",
             parse_mode="HTML",
+            reply_markup=autocomplete_items_kb(houses, "addloc:house"),
         )
 
     @router.message(AddLocationStates.entering_house, F.text)
@@ -534,24 +796,39 @@ def setup_routers(db: Database, voe_client: VOEDataClient) -> Router:
         query = (message.text or "").strip()
         data = await state.get_data()
         street_id = data.get("street_id", "")
-        status_msg = await message.answer("🔍 Перевіряю будинок...")
-        houses = await voe_client.search_houses(street_id, query)
-        if not houses:
-            await status_msg.edit_text(
-                "⚠️ Будинок не знайдено в базі. Оберіть вашу чергу вручну, щоб завершити прив'язку адреси:",
-                reply_markup=queue_picker_kb(),
-            )
-            await state.update_data(house_num=query)
-            await state.set_state(AddLocationStates.choosing_queue)
+        street_name = data.get("street_name", "")
+        await _resolve_or_pick_house(message, state, street_id, street_name, query)
+
+    @router.callback_query(
+        AddLocationStates.selecting_house, F.data.startswith("addloc:free:")
+    )
+    async def cb_select_freeform(call: CallbackQuery, state: FSMContext) -> None:
+        if not call.data or not call.message:
+            return
+        idx = int(call.data.split(":")[2])
+        data = await state.get_data()
+        candidates = data.get("freeform_candidates", [])
+        if idx >= len(candidates):
+            await call.answer("Помилка вибору", show_alert=True)
             return
 
+        chosen = candidates[idx]
         await state.update_data(
-            house_candidates=[{"id": h.id, "label": h.label} for h in houses[:10]]
+            city_id=chosen.get("city_id"),
+            city_name=chosen.get("city_name"),
+            street_id=chosen.get("street_id"),
+            street_name=chosen.get("street_name"),
+            house_num=chosen.get("house"),
+            queue=chosen["queue"],
         )
-        await state.set_state(AddLocationStates.selecting_house)
-        await status_msg.edit_text(
-            "🏠 Оберіть ваш будинок зі списку:",
-            reply_markup=autocomplete_items_kb(houses, "addloc:house"),
+        await state.set_state(AddLocationStates.entering_label)
+        await call.answer()
+        await call.message.edit_text(
+            f"✅ Адресу знайдено: <b>{chosen['display']}</b>\n"
+            f"🔢 Ваша черга ГПВ: <b>{chosen['queue']}</b>\n\n"
+            "🏷 Оберіть назву для цієї локації або напишіть свою:",
+            parse_mode="HTML",
+            reply_markup=label_presets_kb(),
         )
 
     @router.callback_query(
@@ -573,10 +850,28 @@ def setup_routers(db: Database, voe_client: VOEDataClient) -> Router:
         street_id = data.get("street_id", "")
         street_name = data.get("street_name", "")
         house_id = chosen["id"]
-        house_num = chosen["label"]
+        house_num = chosen.get("house_num") or chosen["label"]
+        preset_queue = chosen.get("queue")
+
+        if preset_queue:
+            await state.update_data(
+                house_id=house_id,
+                house_num=house_num,
+                queue=preset_queue,
+            )
+            await state.set_state(AddLocationStates.entering_label)
+            await call.answer()
+            await call.message.edit_text(
+                f"✅ Адресу знайдено: <b>{city_name}, {street_name}, {house_num}</b>\n"
+                f"🔢 Ваша черга ГПВ: <b>{preset_queue}</b>\n\n"
+                "🏷 Оберіть назву для цієї локації або напишіть свою:",
+                parse_mode="HTML",
+                reply_markup=label_presets_kb(),
+            )
+            return
 
         await call.answer("Визначаю чергу ГПВ...")
-        await call.message.edit_text("⏳ Запитую чергу та графік для вашої адреси на сайті Вінницяобленерго...")
+        await call.message.edit_text("⏳ Визначаю чергу та графік для вашої адреси...")
 
         addr_res = await voe_client.fetch_by_address(
             city_id=city_id,
@@ -609,7 +904,7 @@ def setup_routers(db: Database, voe_client: VOEDataClient) -> Router:
             await state.set_state(AddLocationStates.choosing_queue)
             await call.message.edit_text(
                 f"📍 Адреса: <b>{city_name}, {street_name}, {house_num}</b>\n"
-                "Вкажіть вашу чергу ГПВ (якщо ви її знаєте з @pat_voe_bot):",
+                "Вкажіть вашу чергу ГПВ:",
                 parse_mode="HTML",
                 reply_markup=queue_picker_kb(),
             )

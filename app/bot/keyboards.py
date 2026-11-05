@@ -54,18 +54,47 @@ def add_location_method_kb() -> InlineKeyboardMarkup:
     )
 
 
-def queue_picker_kb(prefix: str = "addloc:queue") -> InlineKeyboardMarkup:
+def queue_picker_kb(
+    prefix: str = "addloc:queue",
+    allowed_queues: list[str] | None = None,
+) -> InlineKeyboardMarkup:
+    queues = [q for q in ALL_QUEUES if not allowed_queues or q in allowed_queues]
+    if not queues:
+        queues = list(ALL_QUEUES)
     rows: list[list[InlineKeyboardButton]] = []
-    for i in range(0, len(ALL_QUEUES), 4):
-        chunk = ALL_QUEUES[i : i + 4]
+    step = 4 if len(queues) > 4 else 2
+    for i in range(0, len(queues), step):
+        chunk = queues[i : i + step]
         rows.append(
             [
                 InlineKeyboardButton(
-                    text=f"⚡ {q}", callback_data=f"{prefix}:{q}"
+                    text=f"⚡ Черга {q}" if len(queues) <= 4 else f"⚡ {q}",
+                    callback_data=f"{prefix}:{q}",
                 )
                 for q in chunk
             ]
         )
+    rows.append([InlineKeyboardButton(text="❌ Скасувати", callback_data="addloc:cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def popular_cities_kb(
+    items: list[AutocompleteItem], step_prefix: str = "addloc:city"
+) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for i in range(0, len(items[:10]), 2):
+        chunk = items[i : i + 2]
+        row = []
+        for offset, item in enumerate(chunk):
+            idx = i + offset
+            icon = "🏙" if item.label.startswith("м.") else "🏘"
+            row.append(
+                InlineKeyboardButton(
+                    text=f"{icon} {item.label}"[:40],
+                    callback_data=f"{step_prefix}:{idx}",
+                )
+            )
+        rows.append(row)
     rows.append([InlineKeyboardButton(text="❌ Скасувати", callback_data="addloc:cancel")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 

@@ -19,6 +19,7 @@ except ImportError:
 
 from app.config import ALL_QUEUES, settings
 from app.models import DaySchedule, SlotState
+from app.services.address_index import AddressIndex, download_and_build_voe_index
 from app.services.image_parser import parse_voe_schedule_image
 
 logger = logging.getLogger(__name__)
@@ -38,6 +39,7 @@ DEFAULT_HEADERS = {
 class AutocompleteItem:
     id: str
     label: str
+    queue: Optional[str] = None
 
 
 @dataclass
@@ -49,7 +51,8 @@ class AddressScheduleResult:
 class VOEDataClient:
     """
     Багаторівневий клієнт для отримання графіків відключень світла (АТ «Вінницяобленерго»):
-    1. Сайт voe.com.ua/disconnection/detailed (пошук за адресою: місто -> вулиця -> будинок, визначення черги та таблиці ГПВ).
+    1. Локальний індекс офіційного довідника ГПВ АТ «Вінницяобленерго» (data/voe_addresses.json)
+       + сайт voe.com.ua/disconnection/detailed (пошук за адресою: місто -> вулиця -> будинок).
     2. GitHub JSON mirror (vn-progr/gpv-voe-vinnytsia) — усі 12 черг (1.1..6.2) на сьогодні та завтра.
     3. Офіційний Telegram-бот @pat_voe_bot через Telethon + парсинг зображення графіка.
     """
@@ -60,6 +63,8 @@ class VOEDataClient:
         self._http_client: Optional[httpx.AsyncClient] = None
         self._github_cache_ts: float = 0.0
         self._github_cache_data: dict[tuple[str, date], DaySchedule] = {}
+        self.address_index = AddressIndex()
+        self._voe_live_blocked_until: float = 0.0
 
     def _get_client(self) -> httpx.AsyncClient:
         if self._http_client is None:
@@ -75,34 +80,107 @@ class VOEDataClient:
             await self._http_client.aclose()
             self._http_client = None
 
+    async def refresh_address_index_from_pdf(self) -> int:
+        """Оновлює локальний довідник адрес із офіційного PDF ГПВ на сайті voe.com.ua."""
+        data = await download_and_build_voe_index(self.address_index.index_path)
+        self.address_index.load()
+        return len(data.get("cities", []))
+
+    def get_popular_cities(self, limit: int = 10) -> list[AutocompleteItem]:
+        """Повертає список популярних населених пунктів для швидкого вибору."""
+        items: list[AutocompleteItem] = []
+        for c in self.address_index.get_popular_cities(limit=limit):
+            q_list = c.get("queues", [])
+            q_single = q_list[0] if len(q_list) == 1 and not c.get("has_streets") else None
+            items.append(AutocompleteItem(id=c["id"], label=c["name"], queue=q_single))
+        return items
+
+    def search_address_freeform(self, query: str, limit: int = 8) -> list[dict[str, Any]]:
+        """Швидкий пошук адреси одним рядком (напр. 'Вінниця Соборна 24' або 'Келецька 61')."""
+        return self.address_index.parse_and_search_freeform(query, limit=limit)
+
     # -------------------------------------------------------------------------
-    # 1. Пошук адреси на сайті voe.com.ua/disconnection/detailed
+    # 1. Пошук адреси (локальний індекс ГПВ + voe.com.ua/disconnection/detailed)
     # -------------------------------------------------------------------------
     async def search_cities(self, query: str) -> list[AutocompleteItem]:
-        """Пошук населеного пункту через autocomplete ендпоїнт VOE."""
+        """Пошук населеного пункту через локальний індекс ГПВ та autocomplete VOE."""
+        local_matches = self.address_index.search_cities(query.strip(), limit=15)
+        local_items = [
+            AutocompleteItem(
+                id=c["id"],
+                label=c["name"],
+                queue=c["queues"][0] if len(c.get("queues", [])) == 1 and not c.get("has_streets") else None,
+            )
+            for c in local_matches
+        ]
+        if local_items:
+            return local_items
+
+        if time.monotonic() < self._voe_live_blocked_until:
+            return []
+
         url = f"{self.base_url}/disconnection/detailed/autocomplete/read_city"
         return await self._fetch_autocomplete(url, {"q": query.strip()})
 
     async def search_streets(self, city_id: str, query: str) -> list[AutocompleteItem]:
         """Пошук вулиці у вибраному населеному пункті."""
-        url = f"{self.base_url}/disconnection/detailed/autocomplete/read_street/{city_id}"
-        return await self._fetch_autocomplete(url, {"q": query.strip()})
+        if str(city_id).startswith("c_"):
+            local_streets = self.address_index.search_streets(city_id, query.strip(), limit=15)
+            return [
+                AutocompleteItem(
+                    id=st["id"],
+                    label=st["name"],
+                    queue=st["queues"][0] if len(st.get("queues", [])) == 1 else None,
+                )
+                for st in local_streets
+            ]
+
+        if time.monotonic() >= self._voe_live_blocked_until:
+            url = f"{self.base_url}/disconnection/detailed/autocomplete/read_street/{city_id}"
+            live_items = await self._fetch_autocomplete(url, {"q": query.strip()})
+            if live_items:
+                return live_items
+
+        return []
 
     async def search_houses(self, street_id: str, query: str) -> list[AutocompleteItem]:
         """Пошук номера будинку на вибраній вулиці."""
-        url = f"{self.base_url}/disconnection/detailed/autocomplete/read_house/{street_id}"
-        return await self._fetch_autocomplete(url, {"q": query.strip()})
+        if str(street_id).startswith("c_"):
+            local_houses = self.address_index.search_houses(street_id, query.strip())
+            return [
+                AutocompleteItem(
+                    id=h["id"],
+                    label=h["name"],
+                    queue=h.get("queue"),
+                )
+                for h in local_houses
+            ]
+
+        if time.monotonic() >= self._voe_live_blocked_until:
+            url = f"{self.base_url}/disconnection/detailed/autocomplete/read_house/{street_id}"
+            live_items = await self._fetch_autocomplete(url, {"q": query.strip()})
+            if live_items:
+                return live_items
+
+        return []
 
     async def _fetch_autocomplete(
         self, url: str, params: dict[str, str]
     ) -> list[AutocompleteItem]:
         try:
             client = self._get_client()
-            resp = await client.get(url, params=params, timeout=15.0)
+            resp = await client.get(url, params=params, timeout=4.0)
+            if resp.status_code in (403, 404) or "disconnection.voe.com.ua" in str(resp.url):
+                self._voe_live_blocked_until = time.monotonic() + 600.0
+                return []
             resp.raise_for_status()
+            if "Just a moment..." in resp.text or "cf-browser-verification" in resp.text:
+                self._voe_live_blocked_until = time.monotonic() + 600.0
+                return []
             return self._parse_autocomplete_response(resp)
         except Exception as exc:
-            logger.warning("Autocomplete request failed (%s): %s", url, exc)
+            self._voe_live_blocked_until = time.monotonic() + 300.0
+            logger.debug("Autocomplete request fallback (%s): %s", url, exc)
             return []
 
     @staticmethod
@@ -119,7 +197,7 @@ class VOEDataClient:
                         if isinstance(entry, dict):
                             raw_val = str(entry.get("value") or entry.get("id") or "")
                             raw_lbl = str(entry.get("label") or entry.get("name") or raw_val)
-                            # Якщо label містить HTML (наприклад <div data-id="123">Вінниця</div>)
+                            # Якщо label містить HTML (наприклад <div class="change_api_autocomplit" data-id="123">Вінниця</div>)
                             if "<" in raw_lbl:
                                 soup = BeautifulSoup(raw_lbl, "html.parser")
                                 tag = soup.find(attrs={"data-id": True})
@@ -156,51 +234,104 @@ class VOEDataClient:
         house_num: str = "",
     ) -> Optional[AddressScheduleResult]:
         """
-        Виконує GET + POST запит до форми https://www.voe.com.ua/disconnection/detailed,
-        витягує номер черги (наприклад '3.2') та погодинну таблицю відключень.
+        Визначає чергу ГПВ та розклад за адресою:
+        1. Перевіряє локальний індекс ГПВ (якщо передані локальні ID або назви адреси).
+        2. Якщо це числові ID сайту VOE і сайт не заблокований Cloudflare — виконує запит до /disconnection/detailed.
+        3. Підтягує актуальний розклад для знайденої черги з GitHub JSON mirror.
         """
-        form_url = f"{self.base_url}/disconnection/detailed"
-        try:
-            client = self._get_client()
-            get_resp = await client.get(form_url, timeout=20.0)
-            get_resp.raise_for_status()
-            soup = BeautifulSoup(get_resp.text, "html.parser")
+        resolved_queue: Optional[str] = None
 
-            form_build_id_el = soup.find("input", {"name": "form_build_id"})
-            form_id_el = soup.find("input", {"name": "form_id"})
-            form_build_id = form_build_id_el["value"] if form_build_id_el else ""
-            form_id = (
-                form_id_el["value"]
-                if form_id_el
-                else "disconnection_detailed_search_form"
-            )
+        # 1. Якщо house_id вже містить код черги з локального індексу (формат c_0_s_10_h_24_1.1)
+        m_q = re.search(r"_h_[^_]+_([1-6]\.[12])$", str(house_id))
+        if m_q:
+            resolved_queue = m_q.group(1)
 
-            payload = {
-                "search_type": "0",
-                "city": city_name,
-                "city_id": city_id,
-                "street": street_name,
-                "street_id": street_id,
-                "house": house_num,
-                "house_id": house_id,
-                "form_build_id": form_build_id,
-                "form_id": form_id,
-                "op": "Пошук",
-            }
-            post_resp = await client.post(form_url, data=payload, timeout=20.0)
-            post_resp.raise_for_status()
+        # 2. Якщо street_id з локального індексу
+        if not resolved_queue and str(street_id).startswith("c_"):
+            h_matches = self.address_index.search_houses(street_id, house_num or "")
+            if len(h_matches) == 1:
+                resolved_queue = h_matches[0]["queue"]
+            elif h_matches and h_matches[0].get("score", 0) >= 3:
+                resolved_queue = h_matches[0]["queue"]
 
-            return self.parse_detailed_html(post_resp.text)
-        except Exception as exc:
-            logger.warning("Failed to fetch schedule by address from VOE website: %s", exc)
+        # 3. Якщо city_id з локального індексу і це населений пункт без вулиць з однією чергою
+        if not resolved_queue and str(city_id).startswith("c_") and not street_id:
+            c_obj = self.address_index.get_city(city_id)
+            if c_obj and len(c_obj.get("queues", [])) == 1:
+                resolved_queue = c_obj["queues"][0]
+
+        # 4. Спроба живого запиту до сайту VOE (для числових ID, якщо немає Cloudflare блокування)
+        if not resolved_queue and time.monotonic() >= self._voe_live_blocked_until and str(city_id).isdigit():
+            form_url = f"{self.base_url}/disconnection/detailed"
+            try:
+                client = self._get_client()
+                get_resp = await client.get(form_url, timeout=6.0)
+                if "disconnection.voe.com.ua" in str(get_resp.url) or "Just a moment..." in get_resp.text:
+                    self._voe_live_blocked_until = time.monotonic() + 600.0
+                else:
+                    get_resp.raise_for_status()
+                    soup = BeautifulSoup(get_resp.text, "html.parser")
+
+                    form_build_id_el = soup.find("input", {"name": "form_build_id"})
+                    form_id_el = soup.find("input", {"name": "form_id"})
+                    form_build_id = form_build_id_el["value"] if form_build_id_el else ""
+                    form_id = (
+                        form_id_el["value"]
+                        if form_id_el
+                        else "disconnection_detailed_search_form"
+                    )
+
+                    payload = {
+                        "search_type": "0",
+                        "city": city_name,
+                        "city_id": city_id,
+                        "street": street_name,
+                        "street_id": street_id,
+                        "house": house_num,
+                        "house_id": house_id,
+                        "form_build_id": form_build_id,
+                        "form_id": form_id,
+                        "search": "Показати",
+                        "op": "Пошук",
+                    }
+                    post_resp = await client.post(form_url, data=payload, timeout=8.0)
+                    post_resp.raise_for_status()
+                    live_res = self.parse_detailed_html(post_resp.text)
+                    if live_res:
+                        return live_res
+            except Exception as exc:
+                self._voe_live_blocked_until = time.monotonic() + 300.0
+                logger.debug("Live VOE address lookup fallback: %s", exc)
+
+        # 5. Текстовий пошук у локальному індексі ГПВ за (city_name, street_name, house_num)
+        if not resolved_queue and (city_name or street_name):
+            query_str = ", ".join(p for p in (city_name, street_name, house_num) if p)
+            free_matches = self.address_index.parse_and_search_freeform(query_str, limit=3)
+            if len(free_matches) == 1 or (free_matches and free_matches[0].get("score", 0) >= 2):
+                resolved_queue = free_matches[0]["queue"]
+
+        if not resolved_queue:
             return None
+
+        # Завантажуємо актуальні графіки для знайденої черги з GitHub JSON mirror
+        schedules: dict[date, DaySchedule] = {}
+        gh_all = await self.fetch_all_queues_from_github()
+        for (q_code, s_date), sched in gh_all.items():
+            if q_code == resolved_queue:
+                schedules[s_date] = sched
+
+        return AddressScheduleResult(queue=resolved_queue, schedules=schedules)
 
     @classmethod
     def parse_detailed_html(cls, html_text: str) -> Optional[AddressScheduleResult]:
         """
-        Парсить HTML-відповідь сторінки /disconnection/detailed (у т.ч. Drupal AJAX JSON обгортку, якщо є).
+        Парсить HTML-відповідь сторінки /disconnection/detailed (у т.ч. Drupal AJAX JSON обгортку
+        та div.disconnection-detailed-table-container).
         Визначає чергу (напр. 3.2) та розклад за датами.
         """
+        if not html_text or "Just a moment..." in html_text or "cf-browser-verification" in html_text:
+            return None
+
         # Якщо відповідь прийшла як Drupal AJAX JSON масив команд [{"command": "insert", "data": "..."}]
         if html_text.strip().startswith("["):
             try:
@@ -234,7 +365,48 @@ class VOEDataClient:
         schedules: dict[date, DaySchedule] = {}
         today = datetime.now(settings.tz).date()
 
-        # Шукаємо таблиці або рядки з розкладом
+        # Формат 1 (реальна структура Drupal VOE): div.disconnection-detailed-table-container
+        container = soup.find("div", class_="disconnection-detailed-table-container") or soup.find(
+            "div", class_="disconnection-detailed-table"
+        )
+        if container:
+            cells = [
+                div
+                for div in container.find_all("div", class_="disconnection-detailed-table-cell")
+                if "legend" not in (div.get("class") or []) and "head" not in (div.get("class") or [])
+            ]
+            idx = 0
+            while idx < len(cells):
+                cell = cells[idx]
+                c_classes = cell.get("class") or []
+                if "day_col" in c_classes:
+                    day_txt = cell.get_text(" ", strip=True)
+                    dm = re.search(r"(\d{2})\.(\d{2})(?:\.(\d{4}))?", day_txt)
+                    row_date = today
+                    if dm:
+                        try:
+                            d_val, m_val = int(dm.group(1)), int(dm.group(2))
+                            y_val = int(dm.group(3)) if dm.group(3) else today.year
+                            row_date = date(y_val, m_val, d_val)
+                        except ValueError:
+                            row_date = today
+                    hour_divs = cells[idx + 1 : idx + 25]
+                    if len(hour_divs) == 24:
+                        slots_48: list[SlotState] = []
+                        for h_div in hour_divs:
+                            s1, s2 = cls._classify_voe_div_hour_cell(h_div)
+                            slots_48.extend([s1, s2])
+                        schedules[row_date] = DaySchedule(
+                            queue=queue,
+                            schedule_date=row_date,
+                            slots=slots_48,
+                            source="voe_website",
+                        )
+                    idx += 25
+                else:
+                    idx += 1
+
+        # Формат 2: Класичні HTML <table>
         tables = soup.find_all("table")
         for table in tables:
             for tr in table.find_all("tr"):
@@ -278,6 +450,44 @@ class VOEDataClient:
             return None
 
         return AddressScheduleResult(queue=queue, schedules=schedules)
+
+    @staticmethod
+    def _classify_voe_div_hour_cell(cell: Any) -> tuple[SlotState, SlotState]:
+        """
+        Класифікує одну годинну комірку div.disconnection-detailed-table-cell
+        у два 30-хвилинних слоти (перша та друга половина години).
+        Підтримує класи has_disconnection, full_hour, confirm_1, confirm_0 та div.fill зі змінними --start/--size.
+        """
+        classes = [c.lower() for c in (cell.get("class") or [])]
+        if "has_disconnection" not in classes:
+            return (SlotState.ON, SlotState.ON)
+
+        fill_div = cell.find("div", class_="fill")
+        fill_classes = [c.lower() for c in (fill_div.get("class") or [])] if fill_div else []
+        all_classes = set(classes + fill_classes)
+
+        outage_state = SlotState.POSSIBLE_OFF if "confirm_0" in all_classes else SlotState.OFF
+
+        if "full_hour" in all_classes:
+            return (outage_state, outage_state)
+
+        if fill_div:
+            style = str(fill_div.get("style") or "")
+            start_m = re.search(r"--start\s*:\s*(\d+)", style)
+            size_m = re.search(r"--size\s*:\s*(\d+)", style)
+            start_val = int(start_m.group(1)) if start_m else 0
+            size_val = int(size_m.group(1)) if size_m else 60
+            if start_val == 0 and size_val <= 30:
+                return (outage_state, SlotState.ON)
+            if start_val >= 30:
+                return (SlotState.ON, outage_state)
+
+        if "first_half" in all_classes:
+            return (outage_state, SlotState.ON)
+        if "second_half" in all_classes:
+            return (SlotState.ON, outage_state)
+
+        return (outage_state, outage_state)
 
     @staticmethod
     def _classify_html_cell(cell: Any) -> SlotState:

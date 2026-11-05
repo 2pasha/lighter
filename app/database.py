@@ -206,6 +206,18 @@ class Database:
                         sent_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP::TEXT,
                         PRIMARY KEY (telegram_id, location_id, alert_key)
                     );
+
+                    CREATE TABLE IF NOT EXISTS address_cache (
+                        city_name TEXT NOT NULL,
+                        street_name TEXT NOT NULL DEFAULT '',
+                        house_num TEXT NOT NULL DEFAULT '',
+                        queue TEXT NOT NULL,
+                        city_id TEXT,
+                        street_id TEXT,
+                        house_id TEXT,
+                        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP::TEXT,
+                        PRIMARY KEY (city_name, street_name, house_num)
+                    );
                     """
                 )
             logger.info("Connected to PostgreSQL (Supabase) and verified tables.")
@@ -267,6 +279,18 @@ class Database:
                     alert_key TEXT NOT NULL,
                     sent_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     PRIMARY KEY (telegram_id, location_id, alert_key)
+                );
+
+                CREATE TABLE IF NOT EXISTS address_cache (
+                    city_name TEXT NOT NULL,
+                    street_name TEXT NOT NULL DEFAULT '',
+                    house_num TEXT NOT NULL DEFAULT '',
+                    queue TEXT NOT NULL,
+                    city_id TEXT,
+                    street_id TEXT,
+                    house_id TEXT,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (city_name, street_name, house_num)
                 );
                 """
             )
@@ -505,6 +529,20 @@ class Database:
         house_num: Optional[str] = None,
         house_id: Optional[str] = None,
     ) -> UserLocation:
+        if city_name and queue:
+            try:
+                await self.cache_address_queue(
+                    city_name=city_name,
+                    street_name=street_name,
+                    house_num=house_num,
+                    queue=queue,
+                    city_id=city_id,
+                    street_id=street_id,
+                    house_id=house_id,
+                )
+            except Exception as exc:
+                logger.debug("cache_address_queue skipped: %s", exc)
+
         if self.is_supabase_rest:
             client = self._get_http_client()
             payload = {
@@ -1156,3 +1194,145 @@ class Database:
                 entries,
             )
             await db.commit()
+
+    # -------------------------------------------------------------------------
+    # Address -> Queue Cache
+    # -------------------------------------------------------------------------
+    async def cache_address_queue(
+        self,
+        city_name: str,
+        street_name: Optional[str],
+        house_num: Optional[str],
+        queue: str,
+        city_id: Optional[str] = None,
+        street_id: Optional[str] = None,
+        house_id: Optional[str] = None,
+    ) -> None:
+        """Зберігає відому відповідність (місто, вулиця, будинок) -> черга."""
+        c_name = (city_name or "").strip()
+        s_name = (street_name or "").strip()
+        h_num = (house_num or "").strip()
+        if not c_name or not queue:
+            return
+
+        if self.is_supabase_rest:
+            # У режимі Supabase REST покладаємося на існуючу таблицю locations
+            # та локальний AddressIndex без вимоги міграції нової таблиці в PostgREST.
+            return
+
+        now_str = datetime.now(settings.tz).isoformat(timespec="seconds")
+        if self.is_postgres:
+            pool = await self._get_pg_pool()
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO address_cache (
+                        city_name, street_name, house_num, queue,
+                        city_id, street_id, house_id, updated_at
+                    )
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                    ON CONFLICT (city_name, street_name, house_num) DO UPDATE SET
+                        queue = EXCLUDED.queue,
+                        city_id = COALESCE(EXCLUDED.city_id, address_cache.city_id),
+                        street_id = COALESCE(EXCLUDED.street_id, address_cache.street_id),
+                        house_id = COALESCE(EXCLUDED.house_id, address_cache.house_id),
+                        updated_at = EXCLUDED.updated_at
+                    """,
+                    c_name,
+                    s_name,
+                    h_num,
+                    queue,
+                    city_id,
+                    street_id,
+                    house_id,
+                    now_str,
+                )
+            return
+
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                """
+                INSERT INTO address_cache (
+                    city_name, street_name, house_num, queue,
+                    city_id, street_id, house_id, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (city_name, street_name, house_num) DO UPDATE SET
+                    queue = excluded.queue,
+                    city_id = COALESCE(excluded.city_id, address_cache.city_id),
+                    street_id = COALESCE(excluded.street_id, address_cache.street_id),
+                    house_id = COALESCE(excluded.house_id, address_cache.house_id),
+                    updated_at = excluded.updated_at
+                """,
+                (c_name, s_name, h_num, queue, city_id, street_id, house_id, now_str),
+            )
+            await db.commit()
+
+    async def lookup_cached_address(
+        self,
+        city_name: str,
+        street_name: Optional[str] = None,
+        house_num: Optional[str] = None,
+    ) -> Optional[str]:
+        """Шукає збережену чергу для адреси в address_cache або серед існуючих локацій."""
+        c_name = (city_name or "").strip()
+        s_name = (street_name or "").strip()
+        h_num = (house_num or "").strip()
+        if not c_name:
+            return None
+
+        if self.is_supabase_rest:
+            try:
+                client = self._get_http_client()
+                params: dict[str, str] = {
+                    "select": "queue",
+                    "city_name": f"eq.{c_name}",
+                    "limit": "1",
+                }
+                if s_name:
+                    params["street_name"] = f"eq.{s_name}"
+                if h_num:
+                    params["house_num"] = f"eq.{h_num}"
+                resp = await client.get("/locations", params=params)
+                if resp.status_code == 200:
+                    rows = resp.json()
+                    if rows and rows[0].get("queue"):
+                        return str(rows[0]["queue"])
+            except Exception:
+                pass
+            return None
+
+        if self.is_postgres:
+            pool = await self._get_pg_pool()
+            async with pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    """
+                    SELECT queue FROM address_cache
+                    WHERE LOWER(city_name) = LOWER($1)
+                      AND LOWER(street_name) = LOWER($2)
+                      AND LOWER(house_num) = LOWER($3)
+                    LIMIT 1
+                    """,
+                    c_name,
+                    s_name,
+                    h_num,
+                )
+                if row and row["queue"]:
+                    return str(row["queue"])
+            return None
+
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                """
+                SELECT queue FROM address_cache
+                WHERE LOWER(city_name) = LOWER(?)
+                  AND LOWER(street_name) = LOWER(?)
+                  AND LOWER(house_num) = LOWER(?)
+                LIMIT 1
+                """,
+                (c_name, s_name, h_num),
+            ) as cursor:
+                row = await cursor.fetchone()
+                if row and row[0]:
+                    return str(row[0])
+        return None

@@ -301,9 +301,96 @@ class TestSvitloBotCore(unittest.TestCase):
                 self.assertIn((222, 2, "warn_off:2026-11-05:08:00"), found)
                 self.assertIn((333, 3, "warn_on:2026-11-05:12:00"), found)
                 self.assertNotIn((999, 9, "warn_off:2026-11-05:08:00"), found)
+
+                # Тестуємо кешування адреси -> черги
+                await db.cache_address_queue(
+                    city_name="м. Вінниця",
+                    street_name="вул. Соборна",
+                    house_num="24",
+                    queue="1.1",
+                )
+                cached_q = await db.lookup_cached_address(
+                    "м. Вінниця", "вул. Соборна", "24"
+                )
+                self.assertEqual(cached_q, "1.1")
                 await db.close()
 
         asyncio.run(_run())
+
+    def test_address_index_and_freeform_lookup(self) -> None:
+        from app.services.address_index import AddressIndex
+
+        idx = AddressIndex()
+        self.assertGreater(len(idx.data.get("cities", [])), 1000)
+
+        vin_matches = idx.search_cities("Вінниця")
+        self.assertTrue(vin_matches)
+        self.assertEqual(vin_matches[0]["name"], "м. Вінниця")
+
+        vin_city = idx.get_city(vin_matches[0]["id"])
+        self.assertIsNotNone(vin_city)
+        self.assertGreater(len(vin_city["streets"]), 500)
+
+        # Перевіряємо точне визначення черги за діапазонами та номерами будинків
+        cases = [
+            ("Соборна 24", "1.1"),
+            ("Соборна 81", "2.1"),
+            ("Соборна 10", "2.2"),
+            ("Соборна 68", "3.2"),
+            ("Келецька 10", "2.1"),
+            ("Келецька 120", "4.2"),
+            ("Агрономічне Мічуріна", "1.2"),
+            ("Ладижин Суворова", "3.2"),
+            ("Могилів-Подільський Полтавська", "3.1"),
+            ("с. Побережне", "5.1"),
+        ]
+        for query, expected_queue in cases:
+            res = idx.parse_and_search_freeform(query)
+            self.assertTrue(res, f"No results for {query}")
+            self.assertEqual(res[0]["queue"], expected_queue, f"Mismatch for {query}: {res}")
+
+    def test_parse_voe_detailed_div_html(self) -> None:
+        from app.services.voe_client import VOEDataClient
+
+        cells_html = ['<div class="disconnection-detailed-table-cell cell day_col">05.11.2026</div>']
+        for h in range(24):
+            if h == 4:
+                # Повна година підтвердженого відключення
+                cells_html.append(
+                    '<div class="disconnection-detailed-table-cell cell hour_col has_disconnection full_hour confirm_1">'
+                    '<div class="fill confirm_1" style="--start: 0; --size: 60"></div></div>'
+                )
+            elif h == 5:
+                # Перші 30 хв можливого відключення
+                cells_html.append(
+                    '<div class="disconnection-detailed-table-cell cell hour_col has_disconnection confirm_0">'
+                    '<div class="fill confirm_0" style="--start: 0; --size: 30"></div></div>'
+                )
+            elif h == 6:
+                # Другі 30 хв підтвердженого відключення
+                cells_html.append(
+                    '<div class="disconnection-detailed-table-cell cell hour_col has_disconnection confirm_1">'
+                    '<div class="fill confirm_1" style="--start: 30; --size: 30"></div></div>'
+                )
+            else:
+                cells_html.append('<div class="disconnection-detailed-table-cell cell hour_col"></div>')
+
+        sample_html = f"""
+        <div class="disconnection-detailed-table">
+          <p>2.1 черга</p>
+          <div class="disconnection-detailed-table-container">
+            {''.join(cells_html)}
+          </div>
+        </div>
+        """
+        res = VOEDataClient.parse_detailed_html(sample_html)
+        self.assertIsNotNone(res)
+        self.assertEqual(res.queue, "2.1")
+        sched = res.schedules[date(2026, 11, 5)]
+        self.assertEqual(sched.hour_state(3), (SlotState.ON, SlotState.ON))
+        self.assertEqual(sched.hour_state(4), (SlotState.OFF, SlotState.OFF))
+        self.assertEqual(sched.hour_state(5), (SlotState.POSSIBLE_OFF, SlotState.ON))
+        self.assertEqual(sched.hour_state(6), (SlotState.ON, SlotState.OFF))
 
 
 if __name__ == "__main__":
