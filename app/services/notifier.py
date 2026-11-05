@@ -320,6 +320,12 @@ class NotificationEngine:
             was_off = is_effective_outage(prev_state)
             will_be_off = is_effective_outage(next_state)
 
+            addr_suffix = (
+                f" ({loc.display_address})"
+                if loc.display_address != f"Черга {loc.queue}"
+                else ""
+            )
+
             if not was_off and will_be_off and user.notify_15m_off:
                 # Подія №3: За 15 хвилин вимкнуть світло!
                 alert_key = f"warn_off:{target_date.isoformat()}:{target_time_str}"
@@ -339,7 +345,7 @@ class NotificationEngine:
                     )
                     msg = (
                         f"⚠️🔌 <b>Увага! Відключення світла через 15 хвилин (о {target_time_str})</b>\n\n"
-                        f"📍 Локація: <b>{loc.label}</b> ({loc.display_address})\n"
+                        f"📍 Локація: <b>{loc.label}</b>{addr_suffix}\n"
                         f"🔢 Черга: <b>{loc.queue}</b>\n"
                         f"📌 Статус слоту: {outage_type_str}\n"
                         f"🕒 Орієнтовно до: <b>{end_str}</b> (тривалість: {duration_str})\n\n"
@@ -365,7 +371,7 @@ class NotificationEngine:
                     )
                     msg = (
                         f"💡🎉 <b>Світло має з'явитися через 15 хвилин (о {target_time_str})!</b>\n\n"
-                        f"📍 Локація: <b>{loc.label}</b> ({loc.display_address})\n"
+                        f"📍 Локація: <b>{loc.label}</b>{addr_suffix}\n"
                         f"🔢 Черга: <b>{loc.queue}</b>\n"
                         f"🟢 Наступне відключення: <b>{next_off_str}</b>"
                     )

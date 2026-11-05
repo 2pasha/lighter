@@ -273,8 +273,13 @@ def setup_routers(db: Database, voe_client: VOEDataClient) -> Router:
 
         lines = ["📍 <b>Ваші підключені локації:</b>\n"]
         for loc in locations:
+            addr_suffix = (
+                f" ({loc.display_address})"
+                if loc.display_address != f"Черга {loc.queue}"
+                else ""
+            )
             lines.append(
-                f"• <b>{loc.label}</b> — Черга <b>{loc.queue}</b> ({loc.display_address})"
+                f"• <b>{loc.label}</b> — Черга <b>{loc.queue}</b>{addr_suffix}"
             )
         lines.append("\nНатисніть на локацію для перегляду графіка або додайте нову:")
         await message.answer(
