@@ -25,6 +25,12 @@ ASSETS_DIR = Path(__file__).resolve().parent.parent / "assets"
 FONTS_DIR = ASSETS_DIR / "fonts"
 AVATAR_PATH = ASSETS_DIR / "bot_avatar.png"
 
+_FONT_CACHE: dict[tuple[str, int, str], Any] = {}
+_AVATAR_CACHE: dict[int, tuple[Any, Any]] = {}
+_NOTIFICATION_IMAGE_CACHE: dict[tuple[str, Optional[str], int], bytes] = {}
+_SCHEDULE_IMAGE_CACHE: dict[tuple[str, str, str, Optional[int], int], bytes] = {}
+_SCHEDULE_CACHE_MAX_SIZE = 64
+
 
 def classify_rgb(r: int, g: int, b: int) -> SlotState:
     """
@@ -181,6 +187,17 @@ def render_schedule_image(
     current_hour: Optional[int] = (
         now.hour if now.date() == schedule.schedule_date else None
     )
+
+    cache_key = (
+        schedule.queue,
+        schedule.schedule_date.isoformat(),
+        schedule.content_hash,
+        current_hour,
+        scale,
+    )
+    cached = _SCHEDULE_IMAGE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
 
     s = scale
     w, h = 600 * s, 881 * s
@@ -416,7 +433,12 @@ def render_schedule_image(
 
     buf = io.BytesIO()
     im.save(buf, format="PNG", optimize=True)
-    return buf.getvalue()
+    result_bytes = buf.getvalue()
+    if len(_SCHEDULE_IMAGE_CACHE) >= _SCHEDULE_CACHE_MAX_SIZE:
+        oldest_key = next(iter(_SCHEDULE_IMAGE_CACHE))
+        _SCHEDULE_IMAGE_CACHE.pop(oldest_key, None)
+    _SCHEDULE_IMAGE_CACHE[cache_key] = result_bytes
+    return result_bytes
 
 
 NotificationKind = Literal["light_on", "outage_soon", "schedule_updated"]
@@ -437,6 +459,11 @@ def render_notification_image(
     """
     if not HAS_PIL:
         return None
+
+    notif_cache_key = (kind, slot_state.value if slot_state else None, scale)
+    cached_notif = _NOTIFICATION_IMAGE_CACHE.get(notif_cache_key)
+    if cached_notif is not None:
+        return cached_notif
 
     s = scale
     w, h = 600 * s, 208 * s
@@ -538,13 +565,21 @@ def render_notification_image(
 
     buf = io.BytesIO()
     im.save(buf, format="PNG", optimize=True)
-    return buf.getvalue()
+    result_bytes = buf.getvalue()
+    _NOTIFICATION_IMAGE_CACHE[notif_cache_key] = result_bytes
+    return result_bytes
 
 
 def _paste_circular_avatar(
     base_im: Image.Image, x: int, y: int, size: int
 ) -> None:
     """Малює круглий аватар бота у заданій позиції (x, y) з розміром size×size."""
+    cached_pair = _AVATAR_CACHE.get(size)
+    if cached_pair is not None:
+        white_bg, mask = cached_pair
+        base_im.paste(white_bg, (x, y), mask)
+        return
+
     resample = getattr(Image, "Resampling", Image).LANCZOS
     if AVATAR_PATH.exists():
         try:
@@ -566,6 +601,7 @@ def _paste_circular_avatar(
     # Накладаємо на білу підкладку перед вставкою з круглою маскою
     white_bg = Image.new("RGB", (size, size), (255, 255, 255))
     white_bg.paste(av.convert("RGB"), (0, 0), av.split()[3] if av.mode == "RGBA" else None)
+    _AVATAR_CACHE[size] = (white_bg, mask)
     base_im.paste(white_bg, (x, y), mask)
 
 
@@ -645,6 +681,11 @@ def _draw_split_rounded_cell(
 def _get_font(
     family: str, size: int, weight_name: str = "Regular"
 ) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    cache_key = (family, size, weight_name)
+    cached_font = _FONT_CACHE.get(cache_key)
+    if cached_font is not None:
+        return cached_font
+
     file_map = {
         "Manrope": FONTS_DIR / "Manrope-Variable.ttf",
         "Inter": FONTS_DIR / "Inter-Variable.ttf",
@@ -671,6 +712,7 @@ def _get_font(
                         f.set_variation_by_axes([weight_num])
                 except Exception:
                     pass
+            _FONT_CACHE[cache_key] = f
             return f
         except Exception as exc:
             logger.debug("Could not load bundled font %s: %s", ttf_path, exc)
@@ -687,10 +729,14 @@ def _get_font(
     ]
     for path in candidates:
         try:
-            return ImageFont.truetype(path, size=size)
+            f = ImageFont.truetype(path, size=size)
+            _FONT_CACHE[cache_key] = f
+            return f
         except Exception:
             continue
-    return ImageFont.load_default()
+    default_f = ImageFont.load_default()
+    _FONT_CACHE[cache_key] = default_f
+    return default_f
 
 
 def _draw_centered_text(

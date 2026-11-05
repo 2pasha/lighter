@@ -25,12 +25,14 @@ from app.bot.keyboards import (
     schedule_view_actions_kb,
     settings_kb,
 )
+from app.bot.middlewares import AntiSpamMiddleware
 from app.bot.states import AddLocationStates, QuietHoursStates
 from app.config import ALL_QUEUES, settings
 from app.database import Database, UserLocation
 from app.models import DaySchedule
 from app.services.formatter import format_schedule_message
 from app.services.image_parser import parse_voe_schedule_image, render_schedule_image
+from app.services.notifier import send_photo_cached
 from app.services.voe_client import AutocompleteItem, VOEDataClient
 
 logger = logging.getLogger(__name__)
@@ -38,6 +40,9 @@ logger = logging.getLogger(__name__)
 
 def setup_routers(db: Database, voe_client: VOEDataClient) -> Router:
     router = Router()
+    anti_spam = AntiSpamMiddleware()
+    router.message.middleware(anti_spam)
+    router.callback_query.middleware(anti_spam)
 
     # -------------------------------------------------------------------------
     # /start та /help
@@ -204,18 +209,35 @@ def setup_routers(db: Database, voe_client: VOEDataClient) -> Router:
         kb = schedule_view_actions_kb(loc.id, day_tag)
 
         if img_bytes and len(text) <= 1000:
-            photo = BufferedInputFile(
-                img_bytes, filename=f"voe_{sched.queue}_{sched.schedule_date}.png"
-            )
-            await message.answer_photo(
-                photo=photo, caption=text, parse_mode="HTML", reply_markup=kb
-            )
+            fname = f"voe_{sched.queue}_{sched.schedule_date}.png"
+            if message.bot:
+                await send_photo_cached(
+                    bot=message.bot,
+                    chat_id=message.chat.id,
+                    img_bytes=img_bytes,
+                    filename=fname,
+                    caption=text,
+                    parse_mode="HTML",
+                    reply_markup=kb,
+                )
+            else:
+                photo = BufferedInputFile(img_bytes, filename=fname)
+                await message.answer_photo(
+                    photo=photo, caption=text, parse_mode="HTML", reply_markup=kb
+                )
         else:
             if img_bytes:
-                photo = BufferedInputFile(
-                    img_bytes, filename=f"voe_{sched.queue}_{sched.schedule_date}.png"
-                )
-                await message.answer_photo(photo=photo)
+                fname = f"voe_{sched.queue}_{sched.schedule_date}.png"
+                if message.bot:
+                    await send_photo_cached(
+                        bot=message.bot,
+                        chat_id=message.chat.id,
+                        img_bytes=img_bytes,
+                        filename=fname,
+                    )
+                else:
+                    photo = BufferedInputFile(img_bytes, filename=fname)
+                    await message.answer_photo(photo=photo)
             await message.answer(text, parse_mode="HTML", reply_markup=kb)
 
     # -------------------------------------------------------------------------

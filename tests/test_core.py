@@ -216,6 +216,94 @@ class TestSvitloBotCore(unittest.TestCase):
             img_bytes = render_notification_image(kind, slot_state=st, scale=2)  # type: ignore
             self.assertIsNotNone(img_bytes)
             self.assertTrue(img_bytes.startswith(b"\x89PNG"))
+            # Другий виклик повертає закешований об'єкт з пам'яті миттєво
+            img_bytes_cached = render_notification_image(kind, slot_state=st, scale=2)  # type: ignore
+            self.assertIs(img_bytes, img_bytes_cached)
+
+        sched_png_cached = render_schedule_image(
+            sched, scale=2, now=datetime(2026, 11, 5, 23, 0, tzinfo=ZoneInfo("Europe/Kyiv"))
+        )
+        self.assertIs(sched_png, sched_png_cached)
+
+    def test_anti_spam_middleware_logic(self) -> None:
+        from app.bot.middlewares import AntiSpamMiddleware
+
+        mw = AntiSpamMiddleware(
+            min_message_interval=0.8,
+            min_callback_interval=0.35,
+            refresh_cooldown=5.0,
+            max_burst=4,
+            burst_window=5.0,
+            cooldown_seconds=5.0,
+            warn_cooldown=5.0,
+        )
+
+        # 1. Перше повідомлення о t=10.0 — дозволено
+        allowed, warn, _ = mw.check_user_allowed(user_id=101, is_callback=False, now=10.0)
+        self.assertTrue(allowed)
+        self.assertFalse(warn)
+
+        # 2. Друге повідомлення через 0.2 сек (t=10.2) — заблоковано, видається попередження
+        allowed, warn, msg = mw.check_user_allowed(user_id=101, is_callback=False, now=10.2)
+        self.assertFalse(allowed)
+        self.assertTrue(warn)
+        self.assertIn("Зачекайте", msg)
+
+        # 3. Третє повідомлення через 0.3 сек (t=10.3) — заблоковано БЕЗ повторного попередження (щоб не спамити у відповідь)
+        allowed, warn, _ = mw.check_user_allowed(user_id=101, is_callback=False, now=10.3)
+        self.assertFalse(allowed)
+        self.assertFalse(warn)
+
+        # 4. Повідомлення через 1.0 сек після першого (t=11.0) — знову дозволено
+        allowed, warn, _ = mw.check_user_allowed(user_id=101, is_callback=False, now=11.0)
+        self.assertTrue(allowed)
+
+        # 5. Кнопка "Оновити зараз" (sched:refresh) має 5-секундний кулдаун
+        allowed, warn, _ = mw.check_user_allowed(
+            user_id=202, is_callback=True, callback_data="sched:refresh:1:today", now=20.0
+        )
+        self.assertTrue(allowed)
+        allowed, warn, _ = mw.check_user_allowed(
+            user_id=202, is_callback=True, callback_data="sched:refresh:1:today", now=22.0
+        )
+        self.assertFalse(allowed)
+        self.assertTrue(warn)
+        allowed, warn, _ = mw.check_user_allowed(
+            user_id=202, is_callback=True, callback_data="sched:refresh:1:today", now=25.5
+        )
+        self.assertTrue(allowed)
+
+    def test_batch_sent_alerts_sqlite(self) -> None:
+        import asyncio
+        import tempfile
+        from app.database import Database
+
+        async def _run() -> None:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                db = Database(
+                    db_path=f"{tmpdir}/test.db",
+                    database_url="",
+                    supabase_url="",
+                    supabase_key="",
+                )
+                await db.init_db()
+                await db.mark_alerts_sent_batch(
+                    [
+                        (111, 1, "warn_off:2026-11-05:08:00"),
+                        (222, 2, "warn_off:2026-11-05:08:00"),
+                        (333, 3, "warn_on:2026-11-05:12:00"),
+                    ]
+                )
+                found = await db.get_sent_alerts_for_keys(
+                    ["warn_off:2026-11-05:08:00", "warn_on:2026-11-05:12:00"]
+                )
+                self.assertIn((111, 1, "warn_off:2026-11-05:08:00"), found)
+                self.assertIn((222, 2, "warn_off:2026-11-05:08:00"), found)
+                self.assertIn((333, 3, "warn_on:2026-11-05:12:00"), found)
+                self.assertNotIn((999, 9, "warn_off:2026-11-05:08:00"), found)
+                await db.close()
+
+        asyncio.run(_run())
 
 
 if __name__ == "__main__":

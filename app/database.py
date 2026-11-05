@@ -684,24 +684,34 @@ class Database:
         """Повертає всі активні підписки (користувач + локація) для розсилки сповіщень."""
         if self.is_supabase_rest:
             client = self._get_http_client()
-            resp = await client.get(
-                "/locations",
-                params={
-                    "is_active": "eq.1",
-                    "select": "*,users(*)",
-                },
-            )
-            resp.raise_for_status()
             result: list[tuple[UserProfile, UserLocation]] = []
-            for row in resp.json():
-                u_data = row.get("users")
-                if not u_data:
-                    continue
-                if isinstance(u_data, list):
-                    u_data = u_data[0]
-                user = self._row_to_user(u_data)
-                loc = self._row_to_location(row)
-                result.append((user, loc))
+            page_size = 1000
+            offset = 0
+            while True:
+                resp = await client.get(
+                    "/locations",
+                    params={
+                        "is_active": "eq.1",
+                        "select": "*,users(*)",
+                        "order": "id.asc",
+                        "limit": str(page_size),
+                        "offset": str(offset),
+                    },
+                )
+                resp.raise_for_status()
+                rows = resp.json()
+                for row in rows:
+                    u_data = row.get("users")
+                    if not u_data:
+                        continue
+                    if isinstance(u_data, list):
+                        u_data = u_data[0]
+                    user = self._row_to_user(u_data)
+                    loc = self._row_to_location(row)
+                    result.append((user, loc))
+                if len(rows) < page_size:
+                    break
+                offset += page_size
             return result
 
         query = """
@@ -1032,5 +1042,117 @@ class Database:
                 VALUES (?, ?, ?)
                 """,
                 (telegram_id, location_id, alert_key),
+            )
+            await db.commit()
+
+    async def get_sent_alerts_for_keys(
+        self, alert_keys: list[str]
+    ) -> set[tuple[int, int, str]]:
+        """Повертає множину (telegram_id, location_id, alert_key) для списку ключів за один запит."""
+        if not alert_keys:
+            return set()
+
+        unique_keys = list(set(alert_keys))
+        if self.is_supabase_rest:
+            client = self._get_http_client()
+            result: set[tuple[int, int, str]] = set()
+            in_expr = "(" + ",".join(f'"{k}"' for k in unique_keys) + ")"
+            page_size = 1000
+            offset = 0
+            while True:
+                resp = await client.get(
+                    "/sent_alerts",
+                    params={
+                        "alert_key": f"in.{in_expr}",
+                        "select": "telegram_id,location_id,alert_key",
+                        "limit": str(page_size),
+                        "offset": str(offset),
+                    },
+                )
+                resp.raise_for_status()
+                rows = resp.json()
+                for r in rows:
+                    result.add(
+                        (int(r["telegram_id"]), int(r["location_id"]), str(r["alert_key"]))
+                    )
+                if len(rows) < page_size:
+                    break
+                offset += page_size
+            return result
+
+        if self.is_postgres:
+            pool = await self._get_pg_pool()
+            async with pool.acquire() as conn:
+                rows = await conn.fetch(
+                    """
+                    SELECT telegram_id, location_id, alert_key
+                    FROM sent_alerts
+                    WHERE alert_key = ANY($1::text[])
+                    """,
+                    unique_keys,
+                )
+                return {
+                    (int(r["telegram_id"]), int(r["location_id"]), str(r["alert_key"]))
+                    for r in rows
+                }
+
+        placeholders = ",".join("?" for _ in unique_keys)
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                f"SELECT telegram_id, location_id, alert_key FROM sent_alerts WHERE alert_key IN ({placeholders})",
+                tuple(unique_keys),
+            ) as cursor:
+                rows = await cursor.fetchall()
+                return {(int(r[0]), int(r[1]), str(r[2])) for r in rows}
+
+    async def mark_alerts_sent_batch(
+        self, entries: list[tuple[int, int, str]]
+    ) -> None:
+        """Пакетний запис відправлених сповіщень за один запит."""
+        if not entries:
+            return
+
+        if self.is_supabase_rest:
+            client = self._get_http_client()
+            chunk_size = 500
+            for i in range(0, len(entries), chunk_size):
+                chunk = entries[i : i + chunk_size]
+                payload = [
+                    {
+                        "telegram_id": tg_id,
+                        "location_id": loc_id,
+                        "alert_key": a_key,
+                    }
+                    for tg_id, loc_id, a_key in chunk
+                ]
+                resp = await client.post(
+                    "/sent_alerts",
+                    params={"on_conflict": "telegram_id,location_id,alert_key"},
+                    json=payload,
+                    headers={"Prefer": "resolution=ignore-duplicates"},
+                )
+                resp.raise_for_status()
+            return
+
+        if self.is_postgres:
+            pool = await self._get_pg_pool()
+            async with pool.acquire() as conn:
+                await conn.executemany(
+                    """
+                    INSERT INTO sent_alerts (telegram_id, location_id, alert_key)
+                    VALUES ($1, $2, $3)
+                    ON CONFLICT DO NOTHING
+                    """,
+                    entries,
+                )
+            return
+
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.executemany(
+                """
+                INSERT OR IGNORE INTO sent_alerts (telegram_id, location_id, alert_key)
+                VALUES (?, ?, ?)
+                """,
+                entries,
             )
             await db.commit()

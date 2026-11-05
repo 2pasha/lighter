@@ -124,6 +124,7 @@ async def main() -> None:
         if health_server:
             health_server.close()
             await health_server.wait_closed()
+        await voe_client.close()
         await db.close()
         await bot.session.close()
 

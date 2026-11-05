@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any, Optional
@@ -56,6 +57,23 @@ class VOEDataClient:
     def __init__(self) -> None:
         self.base_url = settings.voe_base_url.rstrip("/")
         self.github_json_url = settings.voe_github_json_url
+        self._http_client: Optional[httpx.AsyncClient] = None
+        self._github_cache_ts: float = 0.0
+        self._github_cache_data: dict[tuple[str, date], DaySchedule] = {}
+
+    def _get_client(self) -> httpx.AsyncClient:
+        if self._http_client is None:
+            self._http_client = httpx.AsyncClient(
+                headers=DEFAULT_HEADERS,
+                timeout=20.0,
+                follow_redirects=True,
+            )
+        return self._http_client
+
+    async def close(self) -> None:
+        if self._http_client is not None:
+            await self._http_client.aclose()
+            self._http_client = None
 
     # -------------------------------------------------------------------------
     # 1. Пошук адреси на сайті voe.com.ua/disconnection/detailed
@@ -79,12 +97,10 @@ class VOEDataClient:
         self, url: str, params: dict[str, str]
     ) -> list[AutocompleteItem]:
         try:
-            async with httpx.AsyncClient(
-                headers=DEFAULT_HEADERS, timeout=15.0, follow_redirects=True
-            ) as client:
-                resp = await client.get(url, params=params)
-                resp.raise_for_status()
-                return self._parse_autocomplete_response(resp)
+            client = self._get_client()
+            resp = await client.get(url, params=params, timeout=15.0)
+            resp.raise_for_status()
+            return self._parse_autocomplete_response(resp)
         except Exception as exc:
             logger.warning("Autocomplete request failed (%s): %s", url, exc)
             return []
@@ -145,38 +161,36 @@ class VOEDataClient:
         """
         form_url = f"{self.base_url}/disconnection/detailed"
         try:
-            async with httpx.AsyncClient(
-                headers=DEFAULT_HEADERS, timeout=20.0, follow_redirects=True
-            ) as client:
-                get_resp = await client.get(form_url)
-                get_resp.raise_for_status()
-                soup = BeautifulSoup(get_resp.text, "html.parser")
+            client = self._get_client()
+            get_resp = await client.get(form_url, timeout=20.0)
+            get_resp.raise_for_status()
+            soup = BeautifulSoup(get_resp.text, "html.parser")
 
-                form_build_id_el = soup.find("input", {"name": "form_build_id"})
-                form_id_el = soup.find("input", {"name": "form_id"})
-                form_build_id = form_build_id_el["value"] if form_build_id_el else ""
-                form_id = (
-                    form_id_el["value"]
-                    if form_id_el
-                    else "disconnection_detailed_search_form"
-                )
+            form_build_id_el = soup.find("input", {"name": "form_build_id"})
+            form_id_el = soup.find("input", {"name": "form_id"})
+            form_build_id = form_build_id_el["value"] if form_build_id_el else ""
+            form_id = (
+                form_id_el["value"]
+                if form_id_el
+                else "disconnection_detailed_search_form"
+            )
 
-                payload = {
-                    "search_type": "0",
-                    "city": city_name,
-                    "city_id": city_id,
-                    "street": street_name,
-                    "street_id": street_id,
-                    "house": house_num,
-                    "house_id": house_id,
-                    "form_build_id": form_build_id,
-                    "form_id": form_id,
-                    "op": "Пошук",
-                }
-                post_resp = await client.post(form_url, data=payload)
-                post_resp.raise_for_status()
+            payload = {
+                "search_type": "0",
+                "city": city_name,
+                "city_id": city_id,
+                "street": street_name,
+                "street_id": street_id,
+                "house": house_num,
+                "house_id": house_id,
+                "form_build_id": form_build_id,
+                "form_id": form_id,
+                "op": "Пошук",
+            }
+            post_resp = await client.post(form_url, data=payload, timeout=20.0)
+            post_resp.raise_for_status()
 
-                return self.parse_detailed_html(post_resp.text)
+            return self.parse_detailed_html(post_resp.text)
         except Exception as exc:
             logger.warning("Failed to fetch schedule by address from VOE website: %s", exc)
             return None
@@ -308,21 +322,32 @@ class VOEDataClient:
     # -------------------------------------------------------------------------
     # 2. GitHub JSON Mirror (vn-progr/gpv-voe-vinnytsia) для всіх 12 черг
     # -------------------------------------------------------------------------
-    async def fetch_all_queues_from_github(self) -> dict[tuple[str, date], DaySchedule]:
+    async def fetch_all_queues_from_github(
+        self, ttl_seconds: float = 30.0
+    ) -> dict[tuple[str, date], DaySchedule]:
         """
         Завантажує актуальний JSON графіків усіх черг (1.1 .. 6.2) з репозиторію
         vn-progr/gpv-voe-vinnytsia (data/Vinnytsiaoblenerho.json).
         Підтримує як формат Yasno/SvitloYeah (`fact.data.<timestamp>.GPV1.1`),
         так і прямий словниковий формат черг.
         """
+        now_mono = time.monotonic()
+        if (
+            self._github_cache_data
+            and (now_mono - self._github_cache_ts) < ttl_seconds
+        ):
+            return dict(self._github_cache_data)
+
         try:
-            async with httpx.AsyncClient(
-                headers=DEFAULT_HEADERS, timeout=15.0, follow_redirects=True
-            ) as client:
-                resp = await client.get(self.github_json_url)
-                resp.raise_for_status()
-                data = resp.json()
-                return self.parse_github_json(data)
+            client = self._get_client()
+            resp = await client.get(self.github_json_url, timeout=15.0)
+            resp.raise_for_status()
+            data = resp.json()
+            parsed = self.parse_github_json(data)
+            if parsed:
+                self._github_cache_ts = now_mono
+                self._github_cache_data = dict(parsed)
+            return parsed
         except Exception as exc:
             logger.warning("GitHub JSON mirror fetch failed: %s", exc)
             return {}
