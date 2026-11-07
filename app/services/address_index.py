@@ -67,6 +67,13 @@ STREET_SYNONYMS = {
     "600-рiччя": "600-річчя",
 }
 
+# Verified address overrides from official portal disconnection.voe.com.ua
+# where VOE's published GPV PDF has gaps, exceptions or omitted house numbers
+KNOWN_ADDRESS_OVERRIDES: dict[tuple[str, str, str], str] = {
+    ("вінниця", "порика", "48"): "3.2",
+    ("вінниця", "василя порика", "48"): "3.2",
+}
+
 FIRST_NAMES = {
     "василя", "миколи", "івана", "дмитра", "олександра", "академіка", "генерала",
     "архітектора", "гетьмана", "петра", "данила", "сергія", "лева", "левка",
@@ -912,6 +919,27 @@ class AddressIndex:
         records = st.get("records", [])
         u_num, u_suf = _parse_house_token(q_house)
 
+        # 0. Check verified address overrides from disconnection.voe.com.ua
+        if city and u_num is not None:
+            c_bare = _strip_city_prefix(city["name"])
+            st_bare = _strip_street_prefix(st["name"])
+            norm_h = f"{u_num}{u_suf}"
+            for (ov_c, ov_st, ov_h), ov_q in KNOWN_ADDRESS_OVERRIDES.items():
+                if ov_c == c_bare and ov_h == norm_h:
+                    if ov_st in (st_bare, _strip_street_initials(st_bare)) or any(
+                        ov_st == _strip_street_prefix(a) for a in st.get("aliases", [])
+                    ):
+                        return [
+                            {
+                                "id": f"{street_id}_h_{q_house}_{ov_q}",
+                                "name": f"буд. {q_house} (черга {ov_q})",
+                                "house": q_house,
+                                "queue": ov_q,
+                                "score": 4,
+                                "matched_ranges": ["disconnection.voe.com.ua"],
+                            }
+                        ]
+
         # 1. Direct match in explicit house ranges (score 1..4)
         scored_queues: dict[str, tuple[int, list[str]]] = {}
         for rec in records:
@@ -966,8 +994,10 @@ class AddressIndex:
                     prox_scores[q_code] = (max(prev_ps, ps), prev_descs)
 
         # High proximity match (score >= 3: adjacent neighbor on same parity):
-        # Even if not directly listed, the adjacent building on the same side is in this queue!
-        if any(s >= 3 for s, _ in prox_scores.values()):
+        # Only use single-winner proximity when the street is NOT split across multiple general queues.
+        # If a street has multiple general coverage queues (e.g. both 3.2 and 4.2), an isolated house number
+        # on another substation must not silently suppress the other valid general queue!
+        if len(general_queues) <= 1 and any(s >= 3 for s, _ in prox_scores.values()):
             top_prox = {q: v for q, v in prox_scores.items() if v[0] >= 3}
             sorted_p = sorted(top_prox.items(), key=lambda x: (-x[1][0], x[0]))
             return [
