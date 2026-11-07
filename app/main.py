@@ -78,10 +78,9 @@ async def main() -> None:
     bot = Bot(token=settings.bot_token)
     dp = Dispatcher(storage=MemoryStorage())
 
-    router = setup_routers(db=db, voe_client=voe_client)
-    dp.include_router(router)
-
     notifier = NotificationEngine(bot=bot, db=db, voe_client=voe_client)
+    router = setup_routers(db=db, voe_client=voe_client, notifier=notifier)
+    dp.include_router(router)
 
     # Налаштовуємо планувальник фонових задач (APScheduler)
     scheduler = AsyncIOScheduler(timezone=settings.tz)

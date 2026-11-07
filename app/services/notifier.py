@@ -182,37 +182,58 @@ class NotificationEngine:
 
         # 4. Зберігаємо графіки в БД та визначаємо події (новий на завтра / зміна графіка)
         for (queue, sched_date), new_sched in fetched_schedules.items():
-            if sched_date < today:
-                continue
+            await self.save_and_notify_if_changed(new_sched, now=now)
 
-            # Ігноруємо порожні шаблони на завтра (0 хв відключень), якщо графіка в БД ще не було
-            existing_sched = await self.db.get_schedule(queue, sched_date)
-            if (
-                sched_date > today
-                and existing_sched is None
-                and new_sched.total_outage_minutes == 0
-            ):
-                continue
+    async def save_and_notify_if_changed(
+        self,
+        new_sched: DaySchedule,
+        now: Optional[datetime] = None,
+    ) -> bool:
+        """
+        Зберігає новий графік у БД. Якщо графік змінився або з'явився новий на завтра,
+        автоматично здійснює розсилку всім активним підписникам відповідної черги.
+        Повертає True, якщо графік змінився та був опрацьований.
+        """
+        if now is None:
+            now = datetime.now(settings.tz)
+        today = now.date()
+        tomorrow = today + timedelta(days=1)
+        sched_date = new_sched.schedule_date
+        queue = new_sched.queue
 
-            changed, old_sched = await self.db.save_schedule(new_sched)
-            if not changed:
-                continue
+        if sched_date < today:
+            return False
 
-            # Розсилаємо сповіщення всім підписникам цієї черги
-            matching_subs = [
-                (user, loc) for user, loc in subscriptions if loc.queue == queue
-            ]
-            if not matching_subs:
-                continue
+        # Ігноруємо порожні шаблони на завтра (0 хв відключень), якщо графіка в БД ще не було
+        existing_sched = await self.db.get_schedule(queue, sched_date)
+        if (
+            sched_date > today
+            and existing_sched is None
+            and new_sched.total_outage_minutes == 0
+        ):
+            return False
 
-            if old_sched is None and sched_date == tomorrow:
-                # Подія №1: З'явився графік на завтра!
-                await self._broadcast_tomorrow_appeared(matching_subs, new_sched, now)
-            elif old_sched is not None:
-                # Подія №2: Графік змінився (на сьогодні або на завтра)!
-                await self._broadcast_schedule_changed(
-                    matching_subs, old_sched, new_sched, now
-                )
+        changed, old_sched = await self.db.save_schedule(new_sched)
+        if not changed:
+            return False
+
+        # Розсилаємо сповіщення всім підписникам цієї черги
+        subscriptions = await self.db.get_all_active_subscriptions()
+        matching_subs = [
+            (user, loc) for user, loc in subscriptions if loc.queue == queue
+        ]
+        if not matching_subs:
+            return True
+
+        if old_sched is None and sched_date == tomorrow:
+            # Подія №1: З'явився графік на завтра!
+            await self._broadcast_tomorrow_appeared(matching_subs, new_sched, now)
+        elif old_sched is not None:
+            # Подія №2: Графік змінився (на сьогодні або на завтра)!
+            await self._broadcast_schedule_changed(
+                matching_subs, old_sched, new_sched, now
+            )
+        return True
 
     async def _broadcast_tomorrow_appeared(
         self,
@@ -280,7 +301,7 @@ class NotificationEngine:
         new_sched: DaySchedule,
         now: datetime,
     ) -> None:
-        # Ігноруємо зміни, які стосуються лише минулих годин або лише кольору (🟡 ↔ 🔴) без зміни годин
+        # Ігноруємо зміни лише кольору (🟡 ↔ 🔴) без зміни наявності світла
         if not has_meaningful_outage_changes(old_sched, new_sched, now=now):
             return
 
@@ -296,7 +317,10 @@ class NotificationEngine:
             return
 
         img_bytes = render_schedule_image(new_sched, now=now)
-        alert_key = f"changed:{new_sched.schedule_date.isoformat()}:{new_sched.content_hash}"
+        alert_key = (
+            f"changed:{new_sched.schedule_date.isoformat()}:"
+            f"{old_sched.content_hash}->{new_sched.content_hash}"
+        )
         diff_block = format_schedule_diff(old_sched, new_sched, now=now)
         day_word = "сьогодні" if new_sched.schedule_date == now.date() else "завтра"
         now_time_str = now.strftime("%H:%M")

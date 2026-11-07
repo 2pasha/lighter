@@ -113,7 +113,7 @@ class TestSvitloBotCore(unittest.TestCase):
         self.assertIn("10:00–11:00", diff_txt)
         self.assertIn("1 год", diff_txt)
 
-        # Перевіряємо, що минулі години та переходи лише між 🟡 і 🔴 ігноруються
+        # Перевіряємо, що переходи лише між 🟡 і 🔴 без зміни наявності світла ігноруються
         from app.services.formatter import has_meaningful_outage_changes
 
         s_color_only = DaySchedule.from_hourly(
@@ -128,8 +128,8 @@ class TestSvitloBotCore(unittest.TestCase):
                 now=datetime(2026, 11, 4, 7, 45, tzinfo=ZoneInfo("Europe/Kyiv")),
             )
         )
-        # Якщо зміна була о 10:00, а зараз вже 21:30 — вона в минулому і не турбує користувача
-        self.assertFalse(
+        # Зміна розкладу на сьогодні фіксується як значуща, навіть якщо змінений інтервал уже розпочався або минув
+        self.assertTrue(
             has_meaningful_outage_changes(
                 s1,
                 s2,
@@ -147,6 +147,56 @@ class TestSvitloBotCore(unittest.TestCase):
         self.assertIn("📊 <b>Всього без світла:</b> 3 год", msg)
         self.assertIn("🔴 підтверджених: 2 год", msg)
         self.assertIn("🟡 можливих: 1 год", msg)
+
+    def test_schedule_change_in_past_and_cancellation(self) -> None:
+        """
+        Тест для сценарію користувача: о 16:29 додано 20:00-22:00 (10 год 30 хв без світла),
+        а о ~20:15 обленерго скасувало це відключення (стало 8 год 30 хв).
+        Сповіщення про скасування повинно надходити завжди: і о 20:15, і о 20:45, і після 22:00.
+        """
+        from app.services.formatter import has_meaningful_outage_changes
+
+        slots_10h30 = [SlotState.ON] * 48
+        for i in range(8, 12):  # 04:00-06:00
+            slots_10h30[i] = SlotState.OFF
+        for i in range(16, 21):  # 08:00-10:30
+            slots_10h30[i] = SlotState.OFF
+        for i in range(32, 36):  # 16:00-18:00
+            slots_10h30[i] = SlotState.OFF
+        for i in range(40, 48):  # 20:00-24:00
+            slots_10h30[i] = SlotState.OFF
+
+        s_with_outage = DaySchedule(
+            queue="3.2", schedule_date=date(2026, 11, 6), slots=slots_10h30
+        )
+        self.assertEqual(s_with_outage.total_outage_minutes, 10 * 60 + 30)
+
+        # Скасування відключення 20:00-22:00 (слоти 40..43 стають ON)
+        slots_8h30 = list(slots_10h30)
+        for i in range(40, 44):
+            slots_8h30[i] = SlotState.ON
+
+        s_cancelled = DaySchedule(
+            queue="3.2", schedule_date=date(2026, 11, 6), slots=slots_8h30
+        )
+        self.assertEqual(s_cancelled.total_outage_minutes, 8 * 60 + 30)
+
+        # Перевіряємо в різні моменти часу: під час інтервалу (20:15, 20:45) та після його завершення (22:05)
+        times_to_test = [
+            datetime(2026, 11, 6, 20, 15, tzinfo=ZoneInfo("Europe/Kyiv")),
+            datetime(2026, 11, 6, 20, 45, tzinfo=ZoneInfo("Europe/Kyiv")),
+            datetime(2026, 11, 6, 22, 5, tzinfo=ZoneInfo("Europe/Kyiv")),
+        ]
+
+        for test_time in times_to_test:
+            self.assertTrue(
+                has_meaningful_outage_changes(s_with_outage, s_cancelled, now=test_time),
+                f"Failed to detect change at {test_time.strftime('%H:%M')}",
+            )
+            diff = format_schedule_diff(s_with_outage, s_cancelled, now=test_time)
+            self.assertIn("20:00–22:00", diff)
+            self.assertIn("Скасовано відключення", diff)
+            self.assertIn("зменшився на <b>2 год</b>", diff)
 
     def test_outage_end_calculation_for_15min_warning(self) -> None:
         # Якщо о 07:45 попередження про відключення з 08:00 до 12:00 (слоти 16..23)
@@ -358,6 +408,77 @@ class TestSvitloBotCore(unittest.TestCase):
             # Для конкретних номерів переконуємось, що немає хибних дублікатів з іншими чергами
             if "48" in query:
                 self.assertEqual(len(res), 1, f"Expected 1 unambiguous result for {query}, got {len(res)}: {res}")
+
+    def test_save_and_notify_if_changed_broadcast(self) -> None:
+        import asyncio
+        import tempfile
+        from unittest.mock import AsyncMock
+        from app.database import Database
+        from app.services.notifier import NotificationEngine
+        from app.services.voe_client import VOEDataClient
+
+        async def _run() -> None:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                db = Database(
+                    db_path=f"{tmpdir}/test_notify.db",
+                    database_url="",
+                    supabase_url="",
+                    supabase_key="",
+                )
+                await db.init_db()
+                await db.upsert_user(1001, username="testuser")
+                await db.add_location(1001, label="🏠 Дім", queue="3.2")
+
+                bot = AsyncMock()
+                voe_client = VOEDataClient()
+                engine = NotificationEngine(bot=bot, db=db, voe_client=voe_client)
+
+                # 1. Початковий графік
+                s1 = DaySchedule(
+                    queue="3.2",
+                    schedule_date=date(2026, 11, 6),
+                    slots=[SlotState.ON] * 48,
+                )
+                changed = await engine.save_and_notify_if_changed(
+                    s1,
+                    now=datetime(2026, 11, 6, 8, 0, tzinfo=ZoneInfo("Europe/Kyiv")),
+                )
+                self.assertTrue(changed)
+
+                # 2. Додано відключення 20:00-22:00
+                slots_with_outage = [SlotState.ON] * 48
+                for i in range(40, 44):
+                    slots_with_outage[i] = SlotState.OFF
+                s2 = DaySchedule(
+                    queue="3.2",
+                    schedule_date=date(2026, 11, 6),
+                    slots=slots_with_outage,
+                )
+                changed = await engine.save_and_notify_if_changed(
+                    s2,
+                    now=datetime(2026, 11, 6, 16, 29, tzinfo=ZoneInfo("Europe/Kyiv")),
+                )
+                self.assertTrue(changed)
+                call_count_1 = bot.send_photo.call_count + bot.send_message.call_count
+                self.assertGreater(call_count_1, 0)
+
+                # 3. Скасовано відключення 20:00-22:00 о 20:15
+                s3 = DaySchedule(
+                    queue="3.2",
+                    schedule_date=date(2026, 11, 6),
+                    slots=[SlotState.ON] * 48,
+                )
+                changed = await engine.save_and_notify_if_changed(
+                    s3,
+                    now=datetime(2026, 11, 6, 20, 15, tzinfo=ZoneInfo("Europe/Kyiv")),
+                )
+                self.assertTrue(changed)
+                call_count_2 = bot.send_photo.call_count + bot.send_message.call_count
+                self.assertGreater(call_count_2, call_count_1)
+
+                await db.close()
+
+        asyncio.run(_run())
 
     def test_parse_voe_detailed_div_html(self) -> None:
         from app.services.voe_client import VOEDataClient

@@ -103,11 +103,11 @@ def has_meaningful_outage_changes(
 ) -> bool:
     """
     Перевіряє, чи змінилися фактичні години відключень (🟢 ↔ 🔴/🟡)
-    у поточному або майбутніх слотах (ігноруючи минулі години сьогоднішнього дня
-    та переходи лише між 🟡 і 🔴).
+    для будь-якого слота доби (ігноруючи переходи лише між 🟡 і 🔴 без зміни наявності світла).
+    Враховує всі зміни розкладу на сьогодні/завтра, навіть якщо змінений інтервал
+    вже розпочався або частково чи повністю минув на момент публікації обленерго.
     """
-    start_slot = _get_comparison_start_slot(new_sched.schedule_date, now)
-    for idx in range(start_slot, 48):
+    for idx in range(48):
         if old_sched.slots[idx].is_outage != new_sched.slots[idx].is_outage:
             return True
     return False
@@ -119,17 +119,15 @@ def format_schedule_diff(
     now: Optional[datetime] = None,
 ) -> str:
     """
-    Формує зрозумілий опис змін у розкладі (лише актуальні/майбутні години,
-    чітко показуючи додані та скасовані інтервали відключень).
+    Формує зрозумілий опис змін у розкладі за всю добу (чітко показуючи додані
+    та скасовані інтервали відключень та зміну сумарного часу без світла).
     """
-    start_slot = _get_comparison_start_slot(new_sched.schedule_date, now)
-
     added_slots = [False] * 48
     removed_slots = [False] * 48
     added_mins = 0
     removed_mins = 0
 
-    for idx in range(start_slot, 48):
+    for idx in range(48):
         was_off = old_sched.slots[idx].is_outage
         now_off = new_sched.slots[idx].is_outage
         if not was_off and now_off:
@@ -163,15 +161,6 @@ def format_schedule_diff(
         )
 
     return "\n".join(diff_lines)
-
-
-def _get_comparison_start_slot(
-    schedule_date: date, now: Optional[datetime]
-) -> int:
-    if now and now.date() == schedule_date:
-        cur_min = now.hour * 60 + now.minute
-        return max(0, min(47, cur_min // 30))
-    return 0
 
 
 def _bool_slots_to_ranges(flags: list[bool]) -> list[str]:

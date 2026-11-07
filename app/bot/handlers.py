@@ -33,17 +33,27 @@ from app.database import Database, UserLocation
 from app.models import DaySchedule
 from app.services.formatter import format_schedule_message
 from app.services.image_parser import parse_voe_schedule_image, render_schedule_image
-from app.services.notifier import send_photo_cached
+from app.services.notifier import NotificationEngine, send_photo_cached
 from app.services.voe_client import AutocompleteItem, VOEDataClient
 
 logger = logging.getLogger(__name__)
 
 
-def setup_routers(db: Database, voe_client: VOEDataClient) -> Router:
+def setup_routers(
+    db: Database,
+    voe_client: VOEDataClient,
+    notifier: Optional[NotificationEngine] = None,
+) -> Router:
     router = Router()
     anti_spam = AntiSpamMiddleware()
     router.message.middleware(anti_spam)
     router.callback_query.middleware(anti_spam)
+
+    async def _save_schedule(s: DaySchedule) -> None:
+        if notifier is not None:
+            await notifier.save_and_notify_if_changed(s)
+        else:
+            await db.save_schedule(s)
 
     # -------------------------------------------------------------------------
     # /start та /help
@@ -160,7 +170,7 @@ def setup_routers(db: Database, voe_client: VOEDataClient) -> Router:
         for (_, d), s in all_github.items():
             if d > today and s.total_outage_minutes == 0:
                 continue
-            await db.save_schedule(s)
+            await _save_schedule(s)
 
         if (loc.queue, target_date) in all_github:
             cand = all_github[(loc.queue, target_date)]
@@ -182,7 +192,7 @@ def setup_routers(db: Database, voe_client: VOEDataClient) -> Router:
                     if d > today and s.total_outage_minutes == 0:
                         continue
                     s.queue = loc.queue
-                    await db.save_schedule(s)
+                    await _save_schedule(s)
                 if target_date in addr_res.schedules:
                     cand = addr_res.schedules[target_date]
                     if target_date <= today or cand.total_outage_minutes > 0:
@@ -885,7 +895,7 @@ def setup_routers(db: Database, voe_client: VOEDataClient) -> Router:
         if addr_res:
             queue = addr_res.queue
             for _, s in addr_res.schedules.items():
-                await db.save_schedule(s)
+                await _save_schedule(s)
             await state.update_data(
                 house_id=house_id,
                 house_num=house_num,
@@ -1066,7 +1076,7 @@ def setup_routers(db: Database, voe_client: VOEDataClient) -> Router:
             parsed_sched = parse_voe_schedule_image(
                 img_bytes, queue=queue, schedule_date=target_date
             )
-            await db.save_schedule(parsed_sched)
+            await _save_schedule(parsed_sched)
 
             # Якщо у користувача ще немає локації з цією чергою, пропонуємо або створюємо
             if not locations:
