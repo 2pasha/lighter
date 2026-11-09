@@ -232,12 +232,21 @@ function buildSmallWidget(data) {
   statusTxt.textColor = t.primary;
   statusTxt.lineLimit = 1;
 
-  const countdownStr = formatDynamicCountdownUk(data);
-  const timeTxt = midStack.addText(countdownStr);
-  timeTxt.font = Font.boldSystemFont(22);
-  timeTxt.textColor = t.primary;
-  timeTxt.lineLimit = 1;
-  timeTxt.minimumScaleFactor = 0.65;
+  const changeDate = parseNextChangeDate(data);
+  if (changeDate) {
+    const timerTxt = midStack.addDate(changeDate);
+    timerTxt.applyTimerStyle();
+    timerTxt.font = Font.boldSystemFont(22);
+    timerTxt.textColor = t.primary;
+    timerTxt.lineLimit = 1;
+    timerTxt.minimumScaleFactor = 0.65;
+  } else {
+    const timeTxt = midStack.addText("без відкл.");
+    timeTxt.font = Font.boldSystemFont(22);
+    timeTxt.textColor = t.primary;
+    timeTxt.lineLimit = 1;
+    timeTxt.minimumScaleFactor = 0.65;
+  }
 
   const nextTxt = midStack.addText(t.nextEventLine);
   nextTxt.font = Font.systemFont(11);
@@ -306,12 +315,21 @@ function buildMediumWidget(data) {
   stTxt.textColor = t.primary;
   stTxt.lineLimit = 1;
 
-  const countdownStr = formatDynamicCountdownUk(data);
-  const mainCountdown = leftCol.addText(countdownStr);
-  mainCountdown.font = Font.boldSystemFont(30);
-  mainCountdown.textColor = t.primary;
-  mainCountdown.lineLimit = 1;
-  mainCountdown.minimumScaleFactor = 0.65;
+  const changeDate = parseNextChangeDate(data);
+  if (changeDate) {
+    const mainCountdown = leftCol.addDate(changeDate);
+    mainCountdown.applyTimerStyle();
+    mainCountdown.font = Font.boldSystemFont(30);
+    mainCountdown.textColor = t.primary;
+    mainCountdown.lineLimit = 1;
+    mainCountdown.minimumScaleFactor = 0.65;
+  } else {
+    const mainCountdown = leftCol.addText("без відкл.");
+    mainCountdown.font = Font.boldSystemFont(28);
+    mainCountdown.textColor = t.primary;
+    mainCountdown.lineLimit = 1;
+    mainCountdown.minimumScaleFactor = 0.65;
+  }
 
   midRow.addSpacer();
 
@@ -395,12 +413,21 @@ function buildRectangularWidget(data) {
   stTxt.textColor = Color.white();
   stTxt.lineLimit = 1;
 
-  const countdownStr = formatDynamicCountdownUk(data);
-  const cdTxt = col.addText(countdownStr);
-  cdTxt.font = Font.boldSystemFont(19);
-  cdTxt.textColor = Color.white();
-  cdTxt.lineLimit = 1;
-  cdTxt.minimumScaleFactor = 0.65;
+  const changeDate = parseNextChangeDate(data);
+  if (changeDate) {
+    const cdTxt = col.addDate(changeDate);
+    cdTxt.applyTimerStyle();
+    cdTxt.font = Font.boldSystemFont(19);
+    cdTxt.textColor = Color.white();
+    cdTxt.lineLimit = 1;
+    cdTxt.minimumScaleFactor = 0.65;
+  } else {
+    const cdTxt = col.addText("без відкл.");
+    cdTxt.font = Font.boldSystemFont(19);
+    cdTxt.textColor = Color.white();
+    cdTxt.lineLimit = 1;
+    cdTxt.minimumScaleFactor = 0.65;
+  }
 
   const nextTxt = col.addText(t.nextEventLine);
   nextTxt.font = Font.systemFont(10);
@@ -439,11 +466,21 @@ function buildCircularWidget(data) {
   mainTxt.font = Font.boldRoundedSystemFont(12);
   mainTxt.minimumScaleFactor = 0.7;
 
-  const subStr = data.timeUntilNextChange || "—";
-  const subTxt = stack.addText(subStr);
-  subTxt.font = Font.systemFont(9);
-  subTxt.textOpacity = 0.85;
-  subTxt.minimumScaleFactor = 0.6;
+  const changeDate = parseNextChangeDate(data);
+  if (changeDate) {
+    const timerTxt = stack.addDate(changeDate);
+    timerTxt.applyTimerStyle();
+    timerTxt.font = Font.boldSystemFont(9);
+    timerTxt.textOpacity = 0.85;
+    timerTxt.minimumScaleFactor = 0.6;
+    timerTxt.centerAlignText();
+  } else {
+    const subStr = data.timeUntilNextChange || "—";
+    const subTxt = stack.addText(subStr);
+    subTxt.font = Font.systemFont(9);
+    subTxt.textOpacity = 0.85;
+    subTxt.minimumScaleFactor = 0.6;
+  }
 
   return w;
 }
