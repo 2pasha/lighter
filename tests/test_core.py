@@ -629,12 +629,14 @@ class TestSvitloBotCore(unittest.TestCase):
         self.assertEqual(payload_on["currentGroup"], "Group 2.1")
         self.assertEqual(payload_on["timeUntilNextChange"], "2h 15m")
         self.assertEqual(payload_on["nextStatusTime"], "14:00")
+        self.assertEqual(payload_on["nextChangeAt"], "2026-11-09T12:00:00Z")
 
         now_offline = datetime(2026, 11, 9, 14, 30, tzinfo=ZoneInfo("Europe/Kyiv"))
         payload_off = build_widget_payload(sched, None, now=now_offline, location_label="🏠 Дім")
         self.assertEqual(payload_off["status"], "offline")
         self.assertEqual(payload_off["timeUntilNextChange"], "1h 30m")
         self.assertEqual(payload_off["nextStatusTime"], "16:00")
+        self.assertEqual(payload_off["nextChangeAt"], "2026-11-09T14:00:00Z")
 
         # 3. Перевірка HTTP-обробника (_handle_http_request для /api/widget/data та /api/widget/script)
         async def _run_http_test() -> None:

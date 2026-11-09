@@ -1,10 +1,9 @@
 /**
- * ⚡ Svitlo Bot — OTA UI Script for Scriptable (v1)
+ * ⚡ Svitlo Bot — OTA UI Script for Scriptable (v2 — Live Timer)
  * Підтримує:
- * - Lock Screen Rectangular (accessoryRectangular)
- * - Lock Screen Circular (accessoryCircular)
- * - Lock Screen Inline (accessoryInline)
- * - Home Screen Small / Medium / Large
+ * - Системний живий зворотний відлік iOS (applyTimerStyle / applyRelativeStyle)
+ * - Розумне планування refreshAfterDate під час самого перемикання світла
+ * - Lock Screen Rectangular, Circular, Inline та Home Screen
  */
 
 async function SvitloWidgetRunner(ctx) {
@@ -58,16 +57,34 @@ async function SvitloWidgetRunner(ctx) {
     widget = buildHomeScreenWidget(data, family);
   }
 
-  // Оновлення кожні 15 хвилин
-  widget.refreshAfterDate = new Date(Date.now() + 15 * 60 * 1000);
+  // Розумне планування наступного фонового оновлення:
+  // За замовчуванням через 15 хвилин, але якщо зміна світла настане раніше —
+  // просимо iOS оновити віджет одразу після моменту перемикання (+10 сек).
+  const nowMs = Date.now();
+  let nextRefreshMs = nowMs + 15 * 60 * 1000;
+  const changeDate = parseNextChangeDate(data);
+  if (changeDate) {
+    const changeMs = changeDate.getTime() + 10 * 1000;
+    if (changeMs > nowMs + 30 * 1000 && changeMs < nextRefreshMs) {
+      nextRefreshMs = changeMs;
+    }
+  }
+  widget.refreshAfterDate = new Date(nextRefreshMs);
 
   if (config.runsInWidget || config.runsInAccessoryWidget) {
     Script.setWidget(widget);
   } else {
-    // При запуску в самому додатку Scriptable показуємо прев'ю домашнього екрану
     await widget.presentSmall();
   }
   Script.complete();
+}
+
+function parseNextChangeDate(data) {
+  if (!data || !data.nextChangeAt) return null;
+  const d = new Date(data.nextChangeAt);
+  if (isNaN(d.getTime())) return null;
+  if (d.getTime() <= Date.now()) return null;
+  return d;
 }
 
 function getStatusVisuals(data) {
@@ -121,6 +138,7 @@ function buildCircularWidget(data) {
   const w = new ListWidget();
   w.setPadding(4, 4, 4, 4);
   const v = getStatusVisuals(data);
+  const changeDate = parseNextChangeDate(data);
 
   const stack = w.addStack();
   stack.layoutVertically();
@@ -146,11 +164,20 @@ function buildCircularWidget(data) {
   mainTxt.font = Font.boldRoundedSystemFont(13);
   mainTxt.minimumScaleFactor = 0.7;
 
-  const subStr = data.timeUntilNextChange || "—";
-  const subTxt = stack.addText(subStr);
-  subTxt.font = Font.systemFont(9);
-  subTxt.textOpacity = 0.8;
-  subTxt.minimumScaleFactor = 0.6;
+  if (changeDate) {
+    const timerTxt = stack.addDate(changeDate);
+    timerTxt.applyTimerStyle();
+    timerTxt.font = Font.monospacedDigitSystemFont(9, 0.2);
+    timerTxt.textOpacity = 0.85;
+    timerTxt.minimumScaleFactor = 0.6;
+    timerTxt.centerAlignText();
+  } else {
+    const subStr = data.timeUntilNextChange || "—";
+    const subTxt = stack.addText(subStr);
+    subTxt.font = Font.systemFont(9);
+    subTxt.textOpacity = 0.8;
+    subTxt.minimumScaleFactor = 0.6;
+  }
 
   return w;
 }
@@ -159,6 +186,7 @@ function buildRectangularWidget(data) {
   const w = new ListWidget();
   w.setPadding(2, 4, 2, 4);
   const v = getStatusVisuals(data);
+  const changeDate = parseNextChangeDate(data);
 
   // Рядок 1: Іконка + Статус + Черга
   const header = w.addStack();
@@ -180,23 +208,38 @@ function buildRectangularWidget(data) {
 
   w.addSpacer(2);
 
-  // Рядок 2: Коли наступна зміна
+  // Рядок 2: Коли наступна зміна + живий таймер зворотного відліку
   const line2 = w.addStack();
   line2.layoutHorizontally();
   line2.centerAlignContent();
 
-  let changeLine = "";
-  if (data.nextStatusTime) {
-    const dur = data.timeUntilNextChangeUk || data.timeUntilNextChange;
-    changeLine = `${v.atPrefix} ${data.nextStatusTime} (${dur})`;
-  } else {
-    changeLine = data.status === "online" ? "Без відключень до кінця доби" : "До кінця доби";
-  }
+  if (data.nextStatusTime && changeDate) {
+    const prefixTxt = line2.addText(`${v.atPrefix} ${data.nextStatusTime} (`);
+    prefixTxt.font = Font.systemFont(11);
+    prefixTxt.minimumScaleFactor = 0.75;
+    prefixTxt.lineLimit = 1;
 
-  const nextTxt = line2.addText(changeLine);
-  nextTxt.font = Font.systemFont(11);
-  nextTxt.minimumScaleFactor = 0.75;
-  nextTxt.lineLimit = 1;
+    const timerTxt = line2.addDate(changeDate);
+    timerTxt.applyTimerStyle();
+    timerTxt.font = Font.monospacedDigitSystemFont(11, 0.3);
+    timerTxt.minimumScaleFactor = 0.75;
+
+    const suffixTxt = line2.addText(")");
+    suffixTxt.font = Font.systemFont(11);
+  } else if (data.nextStatusTime) {
+    const dur = data.timeUntilNextChangeUk || data.timeUntilNextChange;
+    const nextTxt = line2.addText(`${v.atPrefix} ${data.nextStatusTime} (${dur})`);
+    nextTxt.font = Font.systemFont(11);
+    nextTxt.minimumScaleFactor = 0.75;
+    nextTxt.lineLimit = 1;
+  } else {
+    const nextTxt = line2.addText(
+      data.status === "online" ? "Без відключень до кінця доби" : "До кінця доби"
+    );
+    nextTxt.font = Font.systemFont(11);
+    nextTxt.minimumScaleFactor = 0.75;
+    nextTxt.lineLimit = 1;
+  }
 
   w.addSpacer(2);
 
@@ -225,6 +268,7 @@ function buildHomeScreenWidget(data, family) {
   const w = new ListWidget();
   w.setPadding(12, 14, 12, 14);
   const v = getStatusVisuals(data);
+  const changeDate = parseNextChangeDate(data);
 
   const grad = new LinearGradient();
   grad.colors = v.bgGradient;
@@ -274,15 +318,30 @@ function buildHomeScreenWidget(data, family) {
 
   w.addSpacer(4);
 
-  // Інформація про наступну зміну
+  // Інформація про наступну зміну + живий таймер
   if (data.nextStatusTime) {
     const nextLabel = w.addText(`${v.atPrefix} ${data.nextStatusTime}`);
     nextLabel.font = Font.semiboldSystemFont(13);
     nextLabel.textColor = Color.white();
 
-    const remLabel = w.addText(`через ${data.timeUntilNextChangeUk || data.timeUntilNextChange}`);
-    remLabel.font = Font.systemFont(12);
-    remLabel.textColor = new Color("#94a3b8");
+    const timerRow = w.addStack();
+    timerRow.layoutHorizontally();
+    timerRow.centerAlignContent();
+
+    if (changeDate) {
+      const remPrefix = timerRow.addText("через ");
+      remPrefix.font = Font.systemFont(12);
+      remPrefix.textColor = new Color("#94a3b8");
+
+      const liveTimer = timerRow.addDate(changeDate);
+      liveTimer.applyTimerStyle();
+      liveTimer.font = Font.monospacedDigitSystemFont(12, 0.3);
+      liveTimer.textColor = new Color("#e2e8f0");
+    } else {
+      const remLabel = timerRow.addText(`через ${data.timeUntilNextChangeUk || data.timeUntilNextChange}`);
+      remLabel.font = Font.systemFont(12);
+      remLabel.textColor = new Color("#94a3b8");
+    }
   } else {
     const allDay = w.addText(
       data.status === "online" ? "Відключень більше немає 🎉" : "Відключення до 24:00"

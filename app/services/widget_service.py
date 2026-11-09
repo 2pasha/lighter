@@ -50,9 +50,10 @@ def compute_widget_transition(
     tomorrow_sched: Optional[DaySchedule],
     cur_minute: int,
     include_possible: bool = True,
-) -> tuple[str, str, Optional[str]]:
+) -> tuple[str, str, Optional[str], Optional[int]]:
     """
-    Обчислює час до наступної зміни стану (timeUntilNextChange En/Uk) та nextStatusTime (HH:MM).
+    Обчислює час до наступної зміни стану (timeUntilNextChange En/Uk),
+    nextStatusTime (HH:MM) та точну кількість хвилин до переходу (diff_minutes).
     Враховує перехід через північ, якщо відомий графік на завтра.
     """
     cur_slot_idx = max(0, min(47, cur_minute // 30))
@@ -72,7 +73,12 @@ def compute_widget_transition(
             target_min = idx * 30
             diff = max(1, target_min - cur_minute)
             h, m = divmod(target_min, 60)
-            return format_minutes_en(diff), format_minutes_human(diff), f"{h:02d}:{m:02d}"
+            return (
+                format_minutes_en(diff),
+                format_minutes_human(diff),
+                f"{h:02d}:{m:02d}",
+                diff,
+            )
 
     # Якщо до кінця сьогоднішньої доби змін немає, перевіряємо завтрашній графік
     if tomorrow_sched is not None:
@@ -81,7 +87,12 @@ def compute_widget_transition(
                 target_min = idx * 30
                 diff = max(1, (1440 - cur_minute) + target_min)
                 h, m = divmod(target_min, 60)
-                return format_minutes_en(diff), format_minutes_human(diff), f"{h:02d}:{m:02d}"
+                return (
+                    format_minutes_en(diff),
+                    format_minutes_human(diff),
+                    f"{h:02d}:{m:02d}",
+                    diff,
+                )
 
     # Якщо на завтра графіка ще немає або весь день такий самий
     diff_to_midnight = max(1, 1440 - cur_minute)
@@ -90,8 +101,9 @@ def compute_widget_transition(
             format_minutes_en(diff_to_midnight),
             format_minutes_human(diff_to_midnight),
             "24:00",
+            diff_to_midnight,
         )
-    return "0m", "без відкл.", None
+    return "0m", "без відкл.", None, None
 
 
 def build_widget_payload(
@@ -112,7 +124,7 @@ def build_widget_payload(
     else:
         status = "online"
 
-    time_en, time_uk, next_time_str = compute_widget_transition(
+    time_en, time_uk, next_time_str, diff_minutes = compute_widget_transition(
         today_sched=today_sched,
         tomorrow_sched=tomorrow_sched,
         cur_minute=cur_min,
@@ -120,6 +132,14 @@ def build_widget_payload(
     )
 
     now_utc = now.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    next_change_at_iso = ""
+    if diff_minutes is not None:
+        # Точний момент наступної зміни (від початку поточної хвилини + diff_minutes)
+        now_minute_floor = now.replace(second=0, microsecond=0)
+        target_dt = now_minute_floor + timedelta(minutes=diff_minutes)
+        next_change_at_iso = target_dt.astimezone(timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
 
     return {
         "status": status,
@@ -132,6 +152,7 @@ def build_widget_payload(
         "timeUntilNextChange": time_en,
         "timeUntilNextChangeUk": time_uk,
         "nextStatusTime": next_time_str or "",
+        "nextChangeAt": next_change_at_iso,
         "totalOutageMinutes": today_sched.total_outage_minutes,
         "totalOutageTimeUk": format_minutes_human(today_sched.total_outage_minutes),
         "updatedAtLocal": now.strftime("%H:%M"),
