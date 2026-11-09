@@ -617,6 +617,21 @@ class TestSvitloBotCore(unittest.TestCase):
         self.assertIn(b"SvitloWidgetRunner", ota_bytes)
         self.assertIn(b"refreshAfterDate", ota_bytes)
 
+        # Перевіряємо, що вбудовані Base64 PNG-аватари в Svitlo.ota.js не пошкоджені і повністю декодуються
+        import base64
+        import io
+        import re
+        from PIL import Image
+
+        ota_text = ota_bytes.decode("utf-8")
+        for const_name in ("AVATAR_B64", "AVATAR_LS_B64"):
+            match = re.search(rf'const {const_name} = "([^"]+)";', ota_text)
+            self.assertIsNotNone(match, f"Missing {const_name} in Svitlo.ota.js")
+            raw_png = base64.b64decode(match.group(1))
+            with Image.open(io.BytesIO(raw_png)) as av_im:
+                av_im.load()
+                self.assertEqual(av_im.size, (96, 96))
+
         # 2. Перевірка розрахунку статусу та часу до наступної зміни
         hourly = [SlotState.ON] * 24
         hourly[14] = SlotState.OFF
