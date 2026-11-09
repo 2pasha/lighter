@@ -87,6 +87,24 @@ function parseNextChangeDate(data) {
   return d;
 }
 
+function getTimerFont(size) {
+  if (typeof Font.semiboldMonospacedSystemFont === "function") {
+    return Font.semiboldMonospacedSystemFont(size);
+  }
+  if (typeof Font.regularMonospacedSystemFont === "function") {
+    return Font.regularMonospacedSystemFont(size);
+  }
+  return Font.semiboldSystemFont(size);
+}
+
+function getSafeSymbol(name) {
+  let sym = SFSymbol.named(name);
+  if (!sym || !sym.image) {
+    sym = SFSymbol.named("bolt.fill");
+  }
+  return sym && sym.image ? sym : null;
+}
+
 function getStatusVisuals(data) {
   const isOnline = data.status === "online";
   const isPossible = data.slotState === "possible_off";
@@ -146,7 +164,7 @@ function buildCircularWidget(data) {
 
   const iconRow = stack.addStack();
   iconRow.centerAlignContent();
-  const sym = SFSymbol.named(v.icon);
+  const sym = getSafeSymbol(v.icon);
   if (sym) {
     const img = iconRow.addImage(sym.image);
     img.imageSize = new Size(14, 14);
@@ -167,7 +185,7 @@ function buildCircularWidget(data) {
   if (changeDate) {
     const timerTxt = stack.addDate(changeDate);
     timerTxt.applyTimerStyle();
-    timerTxt.font = Font.monospacedDigitSystemFont(9, 0.2);
+    timerTxt.font = getTimerFont(9);
     timerTxt.textOpacity = 0.85;
     timerTxt.minimumScaleFactor = 0.6;
     timerTxt.centerAlignText();
@@ -193,7 +211,7 @@ function buildRectangularWidget(data) {
   header.layoutHorizontally();
   header.centerAlignContent();
 
-  const sym = SFSymbol.named(v.icon);
+  const sym = getSafeSymbol(v.icon);
   if (sym) {
     const img = header.addImage(sym.image);
     img.imageSize = new Size(13, 13);
@@ -221,7 +239,7 @@ function buildRectangularWidget(data) {
 
     const timerTxt = line2.addDate(changeDate);
     timerTxt.applyTimerStyle();
-    timerTxt.font = Font.monospacedDigitSystemFont(11, 0.3);
+    timerTxt.font = getTimerFont(11);
     timerTxt.minimumScaleFactor = 0.75;
 
     const suffixTxt = line2.addText(")");
@@ -303,7 +321,7 @@ function buildHomeScreenWidget(data, family) {
   statusRow.layoutHorizontally();
   statusRow.centerAlignContent();
 
-  const sym = SFSymbol.named(v.icon);
+  const sym = getSafeSymbol(v.icon);
   if (sym) {
     const img = statusRow.addImage(sym.image);
     img.imageSize = new Size(20, 20);
@@ -335,7 +353,7 @@ function buildHomeScreenWidget(data, family) {
 
       const liveTimer = timerRow.addDate(changeDate);
       liveTimer.applyTimerStyle();
-      liveTimer.font = Font.monospacedDigitSystemFont(12, 0.3);
+      liveTimer.font = getTimerFont(12);
       liveTimer.textColor = new Color("#e2e8f0");
     } else {
       const remLabel = timerRow.addText(`через ${data.timeUntilNextChangeUk || data.timeUntilNextChange}`);
