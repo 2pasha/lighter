@@ -45,6 +45,25 @@ class Settings:
         self.official_voe_bot_username: str = os.getenv("OFFICIAL_VOE_BOT_USERNAME", "pat_voe_bot")
 
         self.port: int = int(os.getenv("PORT", "8080"))
+        raw_pub_url = (
+            os.getenv("PUBLIC_BASE_URL")
+            or os.getenv("RENDER_EXTERNAL_URL")
+            or (
+                f"https://{os.getenv('RAILWAY_PUBLIC_DOMAIN')}"
+                if os.getenv("RAILWAY_PUBLIC_DOMAIN")
+                else ""
+            )
+            or (
+                f"https://{os.getenv('FLY_APP_NAME')}.fly.dev"
+                if os.getenv("FLY_APP_NAME")
+                else ""
+            )
+            or "https://svitlo-bot-voe.onrender.com"
+        )
+        self.public_base_url: str = raw_pub_url.strip().rstrip("/")
+        self.widget_secret: str = (
+            os.getenv("WIDGET_SECRET") or self.bot_token or "svitlo_widget_default_secret"
+        ).strip()
 
     @property
     def tz(self) -> ZoneInfo:

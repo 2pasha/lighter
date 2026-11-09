@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import sys
 from asyncio import StreamReader, StreamWriter
 from typing import Optional
+from urllib.parse import parse_qs, urlparse
 
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -15,6 +17,11 @@ from app.config import settings
 from app.database import Database
 from app.services.notifier import NotificationEngine
 from app.services.voe_client import VOEDataClient
+from app.services.widget_service import (
+    get_ota_ui_script_bytes,
+    resolve_widget_data,
+    verify_widget_token,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -24,32 +31,106 @@ logging.basicConfig(
 logger = logging.getLogger("svitlo_bot")
 
 
-async def _handle_healthcheck(reader: StreamReader, writer: StreamWriter) -> None:
-    """Мінімальний HTTP-сервер для перевірок здоров'я (Render / Railway / Fly.io)."""
+def _write_http_response(
+    writer: StreamWriter,
+    status_line: str,
+    body: bytes,
+    content_type: str = "application/json; charset=utf-8",
+) -> None:
+    headers = (
+        f"HTTP/1.1 {status_line}\r\n"
+        f"Content-Type: {content_type}\r\n"
+        f"Content-Length: {len(body)}\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        "Cache-Control: no-store, no-cache, must-revalidate, max-age=0\r\n"
+        "Connection: close\r\n\r\n"
+    ).encode("ascii")
+    writer.write(headers + body)
+
+
+async def _handle_http_request(
+    reader: StreamReader,
+    writer: StreamWriter,
+    db: Optional[Database] = None,
+    voe_client: Optional[VOEDataClient] = None,
+) -> None:
+    """HTTP-сервер для перевірок здоров'я (Render / Railway / Fly.io) та Scriptable iOS-віджета."""
     try:
-        await reader.read(1024)
+        raw_req = await asyncio.wait_for(reader.read(4096), timeout=5.0)
+        req_text = raw_req.decode("utf-8", errors="replace")
+        first_line = req_text.split("\r\n", 1)[0]
+        parts = first_line.split(" ")
+        raw_target = parts[1] if len(parts) >= 2 else "/"
+        parsed = urlparse(raw_target)
+        path = parsed.path.rstrip("/") or "/"
+        qs = parse_qs(parsed.query)
+
+        if path == "/api/widget/script":
+            js_bytes = get_ota_ui_script_bytes()
+            _write_http_response(
+                writer,
+                "200 OK",
+                js_bytes,
+                content_type="application/javascript; charset=utf-8",
+            )
+            await writer.drain()
+            return
+
+        if path == "/api/widget/data" and db is not None and voe_client is not None:
+            raw_uid = (qs.get("userId") or qs.get("user_id") or [""])[0].strip()
+            raw_token = (qs.get("token") or [""])[0].strip()
+            raw_loc_id = (qs.get("locationId") or qs.get("locId") or [""])[0].strip()
+            raw_param = (qs.get("param") or qs.get("queue") or [""])[0].strip()
+
+            user_id = int(raw_uid) if raw_uid.isdigit() else None
+            loc_id = int(raw_loc_id) if raw_loc_id.isdigit() else None
+
+            # Якщо передано токен — перевіряємо його валідність
+            if user_id and raw_token and not verify_widget_token(user_id, raw_token):
+                err_body = json.dumps({"error": "Invalid widget token"}).encode("utf-8")
+                _write_http_response(writer, "403 Forbidden", err_body)
+                await writer.drain()
+                return
+
+            payload = await resolve_widget_data(
+                db=db,
+                voe_client=voe_client,
+                user_id=user_id,
+                location_id=loc_id,
+                param=raw_param,
+            )
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            _write_http_response(writer, "200 OK", body)
+            await writer.drain()
+            return
+
         body = b'{"status":"ok","service":"svitlo_bot"}'
-        response = (
-            b"HTTP/1.1 200 OK\r\n"
-            b"Content-Type: application/json\r\n"
-            b"Content-Length: " + str(len(body)).encode("ascii") + b"\r\n"
-            b"Connection: close\r\n\r\n" + body
-        )
-        writer.write(response)
+        _write_http_response(writer, "200 OK", body)
         await writer.drain()
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("HTTP request handling error: %s", exc)
     finally:
-        writer.close()
+        try:
+            writer.close()
+        except Exception:
+            pass
 
 
-async def start_healthcheck_server(port: int) -> Optional[asyncio.AbstractServer]:
+async def start_healthcheck_server(
+    port: int,
+    db: Optional[Database] = None,
+    voe_client: Optional[VOEDataClient] = None,
+) -> Optional[asyncio.AbstractServer]:
     try:
-        server = await asyncio.start_server(_handle_healthcheck, "0.0.0.0", port)
-        logger.info("Healthcheck HTTP server listening on 0.0.0.0:%d", port)
+        server = await asyncio.start_server(
+            lambda r, w: _handle_http_request(r, w, db=db, voe_client=voe_client),
+            "0.0.0.0",
+            port,
+        )
+        logger.info("HTTP & Widget API server listening on 0.0.0.0:%d", port)
         return server
     except Exception as exc:
-        logger.warning("Could not bind healthcheck server on port %d: %s", port, exc)
+        logger.warning("Could not bind HTTP server on port %d: %s", port, exc)
         return None
 
 
@@ -113,7 +194,9 @@ async def main() -> None:
     # Первинне завантаження графіків під час запуску
     asyncio.create_task(notifier.poll_and_process_schedules())
 
-    health_server = await start_healthcheck_server(settings.port)
+    health_server = await start_healthcheck_server(
+        settings.port, db=db, voe_client=voe_client
+    )
 
     try:
         logger.info("Starting Telegram bot polling...")

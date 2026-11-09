@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import asyncio
+import html
+import json
 import logging
 import re
 import time
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any, Optional
 
 try:
@@ -530,16 +533,16 @@ class VOEDataClient:
         return SlotState.ON
 
     # -------------------------------------------------------------------------
-    # 2. GitHub JSON Mirror (vn-progr/gpv-voe-vinnytsia) для всіх 12 черг
+    # 2. GitHub JSON Mirror (vn-progr/gpv-voe-vinnytsia) + Прямий парсер bezsvitla.com.ua
     # -------------------------------------------------------------------------
     async def fetch_all_queues_from_github(
         self, ttl_seconds: float = 30.0
     ) -> dict[tuple[str, date], DaySchedule]:
         """
-        Завантажує актуальний JSON графіків усіх черг (1.1 .. 6.2) з репозиторію
-        vn-progr/gpv-voe-vinnytsia (data/Vinnytsiaoblenerho.json).
-        Підтримує як формат Yasno/SvitloYeah (`fact.data.<timestamp>.GPV1.1`),
-        так і прямий словниковий формат черг.
+        Завантажує актуальний графік усіх черг (1.1 .. 6.2) з репозиторію
+        vn-progr/gpv-voe-vinnytsia (data/Vinnytsiaoblenerho.json) ТА напряму з
+        bezsvitla.com.ua (із перевіркою часу оновлення кожної підчерги та
+        узгодженням парних підчерг N.1/N.2, якщо одна з них зависла у кеші).
         """
         now_mono = time.monotonic()
         if (
@@ -548,19 +551,325 @@ class VOEDataClient:
         ):
             return dict(self._github_cache_data)
 
+        github_parsed: dict[tuple[str, date], DaySchedule] = {}
         try:
             client = self._get_client()
             resp = await client.get(self.github_json_url, timeout=15.0)
             resp.raise_for_status()
             data = resp.json()
-            parsed = self.parse_github_json(data)
-            if parsed:
-                self._github_cache_ts = now_mono
-                self._github_cache_data = dict(parsed)
-            return parsed
+            github_parsed = self.parse_github_json(data)
         except Exception as exc:
             logger.warning("GitHub JSON mirror fetch failed: %s", exc)
-            return {}
+
+        bezsvitla_parsed: dict[tuple[str, date], DaySchedule] = {}
+        try:
+            bezsvitla_parsed = await self.fetch_all_queues_from_bezsvitla()
+        except Exception as exc:
+            logger.warning("Direct bezsvitla.com.ua fetch failed: %s", exc)
+
+        merged: dict[tuple[str, date], DaySchedule] = dict(github_parsed)
+        # Прямий скрейпер bezsvitla.com.ua має свіжіші дані (без затримки GitHub Actions у 10+ хв)
+        # та містить узгодження завислих підчерг за timestamp Оновлено
+        for key, sched in bezsvitla_parsed.items():
+            merged[key] = sched
+
+        if merged:
+            self._github_cache_ts = now_mono
+            self._github_cache_data = dict(merged)
+        return merged
+
+    async def fetch_all_queues_from_bezsvitla(
+        self,
+    ) -> dict[tuple[str, date], DaySchedule]:
+        """
+        Напряму опитує сторінки черг https://bezsvitla.com.ua/vinnytska-oblast/cherha-{slug}
+        для всіх 12 підчерг (1.1 .. 6.2), витягує точні інтервали та індивідуальний час
+        оновлення кожної підчерги (`dateModified` / `Оновлено`), і усуває розсинхрон
+        між парними підчергами (наприклад, коли 3.1 оновилась сьогодні вранці, а 3.2
+        залишилась із вчорашнім штампом часу).
+        """
+        client = self._get_client()
+        today = datetime.now(settings.tz).date()
+
+        async def _fetch_one(
+            q: str,
+        ) -> tuple[
+            str,
+            Optional[DaySchedule],
+            Optional[datetime],
+            Optional[DaySchedule],
+        ]:
+            slug = q.replace(".", "-")
+            url = f"https://bezsvitla.com.ua/vinnytska-oblast/cherha-{slug}"
+            try:
+                resp = await client.get(url, timeout=12.0)
+                if resp.status_code != 200:
+                    return q, None, None, None
+                today_sched, updated_dt, tomorrow_sched = (
+                    self.parse_bezsvitla_queue_html(resp.text, q, today)
+                )
+                return q, today_sched, updated_dt, tomorrow_sched
+            except Exception as exc:
+                logger.debug("bezsvitla fetch failed for queue %s: %s", q, exc)
+                return q, None, None, None
+
+        tasks = [_fetch_one(q) for q in ALL_QUEUES]
+        results = await asyncio.gather(*tasks, return_exceptions=False)
+
+        schedules: dict[tuple[str, date], DaySchedule] = {}
+        updated_timestamps: dict[str, datetime] = {}
+
+        for q, today_sched, updated_dt, tomorrow_sched in results:
+            if today_sched is not None:
+                schedules[(q, today_sched.schedule_date)] = today_sched
+            if updated_dt is not None:
+                updated_timestamps[q] = updated_dt
+            if (
+                tomorrow_sched is not None
+                and tomorrow_sched.total_outage_minutes > 0
+            ):
+                schedules[(q, tomorrow_sched.schedule_date)] = tomorrow_sched
+
+        self._reconcile_stale_sibling_queues(
+            schedules, updated_timestamps, today
+        )
+        return schedules
+
+    @classmethod
+    def parse_bezsvitla_queue_html(
+        cls, html_text: str, default_queue: str, default_date: date
+    ) -> tuple[Optional[DaySchedule], Optional[datetime], Optional[DaySchedule]]:
+        """
+        Парсить HTML сторінки черги bezsvitla.com.ua.
+        Повертає (today_schedule, updated_at_datetime, tomorrow_schedule).
+        """
+        if not html_text:
+            return None, None, None
+
+        updated_dt: Optional[datetime] = None
+
+        # 1. Витягуємо час оновлення з <time datetime="..."> або JSON-LD "dateModified"
+        iso_match = re.search(
+            r'bz-schedule-hero__stamp--updated[\s\S]{0,400}?datetime=["\']([^"\']+)["\']',
+            html_text,
+            re.IGNORECASE,
+        )
+        if not iso_match:
+            iso_match = re.search(
+                r'"dateModified"\s*:\s*"([^"]+)"', html_text, re.IGNORECASE
+            )
+        if iso_match:
+            try:
+                updated_dt = datetime.fromisoformat(iso_match.group(1).strip())
+            except Exception:
+                updated_dt = None
+
+        if updated_dt is None:
+            upd_text_match = re.search(
+                r'bz-schedule-card__updated[^>]*>\s*(\d{2}\.\d{2}\.\d{4}\s+\d{2}:\d{2})\s*<',
+                html_text,
+                re.IGNORECASE,
+            )
+            if upd_text_match:
+                try:
+                    naive_dt = datetime.strptime(
+                        upd_text_match.group(1).strip(), "%d.%m.%Y %H:%M"
+                    )
+                    updated_dt = naive_dt.replace(tzinfo=settings.tz)
+                except Exception:
+                    updated_dt = None
+
+        # 2. Витягуємо data-schedule-date, data-schedule-intervals та data-schedule-tomorrow
+        sched_date = default_date
+        date_attr_match = re.search(
+            r'data-schedule-date=["\'](\d{4}-\d{2}-\d{2})["\']', html_text
+        )
+        if date_attr_match:
+            try:
+                sched_date = date.fromisoformat(date_attr_match.group(1))
+            except Exception:
+                sched_date = default_date
+
+        today_schedule: Optional[DaySchedule] = None
+        intervals_match = re.search(
+            r'data-schedule-intervals=["\']([^"\']+)["\']', html_text
+        )
+        if intervals_match:
+            raw_json = html.unescape(intervals_match.group(1))
+            slots = cls._parse_bezsvitla_intervals_json(raw_json)
+            if slots:
+                today_schedule = DaySchedule(
+                    queue=default_queue,
+                    schedule_date=sched_date,
+                    slots=slots,
+                    source="voe_json",
+                )
+
+        tomorrow_schedule: Optional[DaySchedule] = None
+        tomorrow_match = re.search(
+            r'data-schedule-tomorrow=["\']([^"\']+)["\']', html_text
+        )
+        if tomorrow_match:
+            raw_tom_json = html.unescape(tomorrow_match.group(1))
+            tom_slots = cls._parse_bezsvitla_intervals_json(raw_tom_json)
+            if tom_slots and any(s.is_outage for s in tom_slots):
+                tomorrow_schedule = DaySchedule(
+                    queue=default_queue,
+                    schedule_date=sched_date + timedelta(days=1),
+                    slots=tom_slots,
+                    source="voe_json",
+                )
+
+        # Fallback: парсинг карток .bz-schedule-slot, якщо атрибут data-schedule-intervals відсутній
+        if today_schedule is None and BeautifulSoup is not Any:
+            soup = BeautifulSoup(html_text, "html.parser")
+            slot_Els = soup.select(".bz-schedule-slot")
+            if slot_Els:
+                slots = [SlotState.ON] * 48
+                found_any = False
+                for el in slot_Els:
+                    classes = " ".join(el.get("class", [])).lower()
+                    time_el = el.select_one(".bz-schedule-slot__time")
+                    if not time_el:
+                        continue
+                    t_text = time_el.get_text(" ", strip=True)
+                    m = re.search(
+                        r"(\d{1,2}):(\d{2})\s*[–—\-]\s*(\d{1,2}):(\d{2})",
+                        t_text,
+                    )
+                    if not m:
+                        continue
+                    found_any = True
+                    sh, sm, eh, em = (
+                        int(m.group(1)),
+                        int(m.group(2)),
+                        int(m.group(3)),
+                        int(m.group(4)),
+                    )
+                    start_idx = max(0, min(48, sh * 2 + (1 if sm >= 30 else 0)))
+                    end_idx = (
+                        48
+                        if (eh == 24 or (eh == 0 and em == 0 and sh > 0))
+                        else max(0, min(48, eh * 2 + (1 if em >= 30 else 0)))
+                    )
+                    if "possible" in classes or "maybe" in classes:
+                        st = SlotState.POSSIBLE_OFF
+                    elif "off" in classes:
+                        st = SlotState.OFF
+                    else:
+                        st = SlotState.ON
+                    for idx in range(start_idx, end_idx):
+                        slots[idx] = st
+                if found_any:
+                    today_schedule = DaySchedule(
+                        queue=default_queue,
+                        schedule_date=sched_date,
+                        slots=slots,
+                        source="voe_json",
+                    )
+
+        return today_schedule, updated_dt, tomorrow_schedule
+
+    @staticmethod
+    def _parse_bezsvitla_intervals_json(
+        raw_json: str,
+    ) -> Optional[list[SlotState]]:
+        try:
+            items = json.loads(raw_json)
+        except Exception:
+            return None
+        if not isinstance(items, list) or not items:
+            return None
+
+        slots = [SlotState.ON] * 48
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            from_str = str(item.get("from", "")).strip()
+            to_str = str(item.get("to", "")).strip()
+            state_str = str(item.get("state", "ON")).strip().upper()
+            m1 = re.match(r"^(\d{1,2}):(\d{2})$", from_str)
+            m2 = re.match(r"^(\d{1,2}):(\d{2})$", to_str)
+            if not (m1 and m2):
+                continue
+            sh, sm = int(m1.group(1)), int(m1.group(2))
+            eh, em = int(m2.group(1)), int(m2.group(2))
+            start_idx = max(0, min(48, sh * 2 + (1 if sm >= 30 else 0)))
+            end_idx = (
+                48
+                if (eh == 24 or (eh == 0 and em == 0 and sh > 0))
+                else max(0, min(48, eh * 2 + (1 if em >= 30 else 0)))
+            )
+            if state_str in ("POSSIBLE", "MAYBE", "POSSIBLE_OFF", "YELLOW"):
+                st = SlotState.POSSIBLE_OFF
+            elif state_str in ("OFF", "NO", "OUTAGE"):
+                st = SlotState.OFF
+            else:
+                st = SlotState.ON
+            for idx in range(start_idx, end_idx):
+                slots[idx] = st
+        return slots
+
+    @staticmethod
+    def _reconcile_stale_sibling_queues(
+        schedules: dict[tuple[str, date], DaySchedule],
+        updated_timestamps: dict[str, datetime],
+        target_date: date,
+    ) -> None:
+        """
+        Усуває затримку оновлення підчерги на bezsvitla.com.ua:
+        Якщо в парі підчерг (наприклад, 3.1 та 3.2) одна підчерга (3.1) оновилась
+        сьогодні (`updated_at.date() >= target_date`), а інша (3.2) досі має вчорашній
+        timestamp (`updated_at.date() < target_date`), і всі слоти відключень свіжої
+        підчерги є підмножиною слотів застарілої підчерги (тобто частину відключень
+        було скасовано за командою НЕК «Укренерго», наприклад, 10:00–12:00),
+        застосовуємо актуальний розклад свіжої підчерги до застарілої.
+        """
+        for major in range(1, 7):
+            q1 = f"{major}.1"
+            q2 = f"{major}.2"
+            s1 = schedules.get((q1, target_date))
+            s2 = schedules.get((q2, target_date))
+            t1 = updated_timestamps.get(q1)
+            t2 = updated_timestamps.get(q2)
+            if not (s1 and s2 and t1 and t2):
+                continue
+
+            d1 = t1.astimezone(settings.tz).date() if t1.tzinfo else t1.date()
+            d2 = t2.astimezone(settings.tz).date() if t2.tzinfo else t2.date()
+
+            fresh_q, fresh_s, stale_q, stale_s = None, None, None, None
+            if d1 >= target_date and d2 < target_date:
+                fresh_q, fresh_s, stale_q, stale_s = q1, s1, q2, s2
+            elif d2 >= target_date and d1 < target_date:
+                fresh_q, fresh_s, stale_q, stale_s = q2, s2, q1, s1
+
+            if fresh_s is None or stale_s is None or stale_q is None:
+                continue
+
+            # Перевіряємо, що всі відключення свіжої підчерги входять у застарілу підчергу,
+            # а застаріла підчерга має додаткові (вже скасовані) слоти відключень
+            fresh_outages = {
+                idx for idx, st in enumerate(fresh_s.slots) if st.is_outage
+            }
+            stale_outages = {
+                idx for idx, st in enumerate(stale_s.slots) if st.is_outage
+            }
+            if fresh_outages and fresh_outages.issubset(stale_outages) and fresh_outages != stale_outages:
+                logger.info(
+                    "Reconciling stale sub-queue %s (updated %s) with fresh sibling %s (updated %s) for %s",
+                    stale_q,
+                    updated_timestamps.get(stale_q),
+                    fresh_q,
+                    updated_timestamps.get(fresh_q),
+                    target_date,
+                )
+                schedules[(stale_q, target_date)] = DaySchedule(
+                    queue=stale_q,
+                    schedule_date=target_date,
+                    slots=list(fresh_s.slots),
+                    source=fresh_s.source,
+                )
 
     @classmethod
     def parse_github_json(
@@ -704,10 +1013,17 @@ class VOEDataClient:
             ) as client:
                 bot_entity = await client.get_entity(settings.official_voe_bot_username)
                 # Шукаємо останні повідомлення з фото в діалозі з ботом або запитуємо графік
-                messages = await client.get_messages(bot_entity, limit=10)
+                messages = await client.get_messages(bot_entity, limit=15)
                 date_str = target_date.strftime("%d.%m.%Y")
+                q_norm = queue.strip()
                 for msg in messages:
                     if msg.photo:
+                        caption = (getattr(msg, "message", "") or "").strip()
+                        if caption:
+                            if q_norm not in caption and f"{q_norm} черга" not in caption:
+                                continue
+                            if date_str not in caption:
+                                continue
                         img_bytes = await client.download_media(msg.photo, file=bytes)
                         if img_bytes:
                             parsed = parse_voe_schedule_image(

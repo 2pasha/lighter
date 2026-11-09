@@ -931,6 +931,19 @@ class Database:
             if same_outage_mask:
                 return False, existing
 
+            # Якщо користувач або Telethon завантажив свіжий офіційний графік з @pat_voe_bot
+            # (`telegram_bot_image`), де частину відключень скасовано (підмножина слотів),
+            # не дозволяємо застарілому `voe_json` перезаписати його назад
+            if existing.source == "telegram_bot_image":
+                existing_outages = {
+                    idx for idx, st in enumerate(existing.slots) if st.is_outage
+                }
+                incoming_outages = {
+                    idx for idx, st in enumerate(schedule.slots) if st.is_outage
+                }
+                if existing_outages and existing_outages.issubset(incoming_outages):
+                    return False, existing
+
         if self.is_supabase_rest:
             client = self._get_http_client()
             payload = {

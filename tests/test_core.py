@@ -523,6 +523,202 @@ class TestSvitloBotCore(unittest.TestCase):
         self.assertEqual(sched.hour_state(5), (SlotState.POSSIBLE_OFF, SlotState.ON))
         self.assertEqual(sched.hour_state(6), (SlotState.ON, SlotState.OFF))
 
+    def test_parse_bezsvitla_html_and_reconcile_sibling_queues(self) -> None:
+        from app.services.voe_client import VOEDataClient
+
+        html_3_1 = """
+        <div class="bz-schedule-hero__meta">
+          <span class="bz-schedule-hero__stamp bz-schedule-hero__stamp--updated">
+            Оновлено: <time datetime="2026-11-07T09:55:00+02:00">07.11.2026 09:55</time>
+          </span>
+        </div>
+        <div class="bz-schedule-countdown" data-bz-schedule-countdown
+             data-schedule-tomorrow="[]"
+             data-schedule-date="2026-11-07"
+             data-schedule-intervals="[{&quot;from&quot;:&quot;00:00&quot;,&quot;to&quot;:&quot;04:00&quot;,&quot;state&quot;:&quot;ON&quot;},{&quot;from&quot;:&quot;04:00&quot;,&quot;to&quot;:&quot;06:00&quot;,&quot;state&quot;:&quot;OFF&quot;},{&quot;from&quot;:&quot;06:00&quot;,&quot;to&quot;:&quot;14:00&quot;,&quot;state&quot;:&quot;ON&quot;},{&quot;from&quot;:&quot;14:00&quot;,&quot;to&quot;:&quot;18:00&quot;,&quot;state&quot;:&quot;OFF&quot;},{&quot;from&quot;:&quot;18:00&quot;,&quot;to&quot;:&quot;22:00&quot;,&quot;state&quot;:&quot;ON&quot;},{&quot;from&quot;:&quot;22:00&quot;,&quot;to&quot;:&quot;24:00&quot;,&quot;state&quot;:&quot;OFF&quot;}]">
+        </div>
+        """
+        html_3_2_stale = """
+        <div class="bz-schedule-hero__meta">
+          <span class="bz-schedule-hero__stamp bz-schedule-hero__stamp--updated">
+            Оновлено: <time datetime="2026-11-06T21:05:00+02:00">06.11.2026 21:05</time>
+          </span>
+        </div>
+        <div class="bz-schedule-countdown" data-bz-schedule-countdown
+             data-schedule-tomorrow="[]"
+             data-schedule-date="2026-11-07"
+             data-schedule-intervals="[{&quot;from&quot;:&quot;00:00&quot;,&quot;to&quot;:&quot;04:00&quot;,&quot;state&quot;:&quot;ON&quot;},{&quot;from&quot;:&quot;04:00&quot;,&quot;to&quot;:&quot;06:00&quot;,&quot;state&quot;:&quot;OFF&quot;},{&quot;from&quot;:&quot;06:00&quot;,&quot;to&quot;:&quot;10:00&quot;,&quot;state&quot;:&quot;ON&quot;},{&quot;from&quot;:&quot;10:00&quot;,&quot;to&quot;:&quot;12:00&quot;,&quot;state&quot;:&quot;OFF&quot;},{&quot;from&quot;:&quot;12:00&quot;,&quot;to&quot;:&quot;14:00&quot;,&quot;state&quot;:&quot;ON&quot;},{&quot;from&quot;:&quot;14:00&quot;,&quot;to&quot;:&quot;18:00&quot;,&quot;state&quot;:&quot;OFF&quot;},{&quot;from&quot;:&quot;18:00&quot;,&quot;to&quot;:&quot;22:00&quot;,&quot;state&quot;:&quot;ON&quot;},{&quot;from&quot;:&quot;22:00&quot;,&quot;to&quot;:&quot;24:00&quot;,&quot;state&quot;:&quot;OFF&quot;}]">
+        </div>
+        """
+
+        target_day = date(2026, 11, 7)
+        s31, dt31, _ = VOEDataClient.parse_bezsvitla_queue_html(html_3_1, "3.1", target_day)
+        s32, dt32, _ = VOEDataClient.parse_bezsvitla_queue_html(html_3_2_stale, "3.2", target_day)
+
+        self.assertIsNotNone(s31)
+        self.assertIsNotNone(s32)
+        self.assertIsNotNone(dt31)
+        self.assertIsNotNone(dt32)
+        self.assertEqual(s31.total_outage_minutes, 8 * 60)
+        self.assertEqual(s32.total_outage_minutes, 10 * 60)
+
+        schedules = {
+            ("3.1", target_day): s31,
+            ("3.2", target_day): s32,
+        }
+        updated_timestamps = {
+            "3.1": dt31,
+            "3.2": dt32,
+        }
+        VOEDataClient._reconcile_stale_sibling_queues(
+            schedules, updated_timestamps, target_day
+        )
+
+        reconciled_32 = schedules[("3.2", target_day)]
+        self.assertEqual(reconciled_32.total_outage_minutes, 8 * 60)
+        self.assertEqual(reconciled_32.hour_state(10), (SlotState.ON, SlotState.ON))
+        self.assertEqual(reconciled_32.hour_state(11), (SlotState.ON, SlotState.ON))
+
+    def test_widget_service_and_http_endpoints(self) -> None:
+        import asyncio
+        import json
+        import tempfile
+        from unittest.mock import AsyncMock
+        from app.database import Database
+        from app.main import start_healthcheck_server
+        from app.services.voe_client import VOEDataClient
+        from app.services.widget_service import (
+            build_widget_payload,
+            generate_user_loader_js,
+            generate_widget_token,
+            get_ota_ui_script_bytes,
+            verify_widget_token,
+        )
+
+        # 1. Токен та генерація Svitlo.js Loader
+        uid = 123456789
+        tok = generate_widget_token(uid)
+        self.assertTrue(verify_widget_token(uid, tok))
+        self.assertFalse(verify_widget_token(uid, "wrong_token"))
+
+        loader_bytes = generate_user_loader_js(
+            user_id=uid,
+            base_url="https://example.com",
+            default_location_id=42,
+        )
+        loader_str = loader_bytes.decode("utf-8")
+        self.assertIn('const BASE_URL = "https://example.com";', loader_str)
+        self.assertIn('const USER_ID = "123456789";', loader_str)
+        self.assertIn(f'const TOKEN = "{tok}";', loader_str)
+        self.assertIn('const DEFAULT_LOCATION_ID = "42";', loader_str)
+        self.assertIn("/api/widget/script", loader_str)
+
+        ota_bytes = get_ota_ui_script_bytes()
+        self.assertIn(b"SvitloWidgetRunner", ota_bytes)
+        self.assertIn(b"refreshAfterDate", ota_bytes)
+
+        # 2. Перевірка розрахунку статусу та часу до наступної зміни
+        hourly = [SlotState.ON] * 24
+        hourly[14] = SlotState.OFF
+        hourly[15] = SlotState.OFF
+        sched = DaySchedule.from_hourly("2.1", date(2026, 11, 9), hourly)
+
+        now_online = datetime(2026, 11, 9, 11, 45, tzinfo=ZoneInfo("Europe/Kyiv"))
+        payload_on = build_widget_payload(sched, None, now=now_online, location_label="🏠 Дім")
+        self.assertEqual(payload_on["status"], "online")
+        self.assertEqual(payload_on["currentGroup"], "Group 2.1")
+        self.assertEqual(payload_on["timeUntilNextChange"], "2h 15m")
+        self.assertEqual(payload_on["nextStatusTime"], "14:00")
+
+        now_offline = datetime(2026, 11, 9, 14, 30, tzinfo=ZoneInfo("Europe/Kyiv"))
+        payload_off = build_widget_payload(sched, None, now=now_offline, location_label="🏠 Дім")
+        self.assertEqual(payload_off["status"], "offline")
+        self.assertEqual(payload_off["timeUntilNextChange"], "1h 30m")
+        self.assertEqual(payload_off["nextStatusTime"], "16:00")
+
+        # 3. Перевірка HTTP-обробника (_handle_http_request для /api/widget/data та /api/widget/script)
+        async def _run_http_test() -> None:
+            from app.main import _handle_http_request
+
+            class DummyWriter:
+                def __init__(self) -> None:
+                    self.buffer = bytearray()
+
+                def write(self, data: bytes) -> None:
+                    self.buffer.extend(data)
+
+                async def drain(self) -> None:
+                    pass
+
+                def close(self) -> None:
+                    pass
+
+            with tempfile.TemporaryDirectory() as tmpdir:
+                db = Database(
+                    db_path=f"{tmpdir}/test_widget.db",
+                    database_url="",
+                    supabase_url="",
+                    supabase_key="",
+                )
+                await db.init_db()
+                await db.upsert_user(uid, username="tester")
+                loc = await db.add_location(uid, label="🏠 Дім", queue="2.1")
+                today = datetime.now(ZoneInfo("Europe/Kyiv")).date()
+                await db.save_schedule(DaySchedule.from_hourly("2.1", today, hourly))
+
+                voe_client = AsyncMock(spec=VOEDataClient)
+                voe_client.fetch_all_queues_from_github.return_value = {}
+
+                # Запит /api/widget/data
+                reader = asyncio.StreamReader()
+                req = (
+                    f"GET /api/widget/data?userId={uid}&token={tok}&locationId={loc.id} HTTP/1.1\r\n"
+                    f"Host: localhost\r\n\r\n"
+                )
+                reader.feed_data(req.encode("ascii"))
+                reader.feed_eof()
+                writer = DummyWriter()
+
+                await _handle_http_request(reader, writer, db=db, voe_client=voe_client)  # type: ignore
+
+                raw_resp = bytes(writer.buffer)
+                header_part, body_part = raw_resp.split(b"\r\n\r\n", 1)
+                self.assertIn(b"200 OK", header_part)
+                data = json.loads(body_part.decode("utf-8"))
+                self.assertIn(data["status"], ("online", "offline"))
+                self.assertEqual(data["currentGroup"], "Group 2.1")
+                self.assertEqual(data["queue"], "2.1")
+                self.assertIn("timeUntilNextChange", data)
+                self.assertIn("nextStatusTime", data)
+                self.assertIn("lastUpdated", data)
+
+                # Запит з невірним токеном -> 403 Forbidden
+                reader_bad = asyncio.StreamReader()
+                reader_bad.feed_data(
+                    f"GET /api/widget/data?userId={uid}&token=invalid HTTP/1.1\r\nHost: localhost\r\n\r\n".encode("ascii")
+                )
+                reader_bad.feed_eof()
+                writer_bad = DummyWriter()
+                await _handle_http_request(reader_bad, writer_bad, db=db, voe_client=voe_client)  # type: ignore
+                self.assertIn(b"403 Forbidden", bytes(writer_bad.buffer))
+
+                # Запит /api/widget/script
+                reader2 = asyncio.StreamReader()
+                reader2.feed_data(
+                    b"GET /api/widget/script?v=1 HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                )
+                reader2.feed_eof()
+                writer2 = DummyWriter()
+                await _handle_http_request(reader2, writer2, db=db, voe_client=voe_client)  # type: ignore
+
+                s_headers, s_body = bytes(writer2.buffer).split(b"\r\n\r\n", 1)
+                self.assertIn(b"200 OK", s_headers)
+                self.assertIn(b"SvitloWidgetRunner", s_body)
+
+                await db.close()
+
+        asyncio.run(_run_http_test())
+
 
 if __name__ == "__main__":
     unittest.main()

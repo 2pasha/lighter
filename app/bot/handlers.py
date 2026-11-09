@@ -35,6 +35,7 @@ from app.services.formatter import format_schedule_message
 from app.services.image_parser import parse_voe_schedule_image, render_schedule_image
 from app.services.notifier import NotificationEngine, send_photo_cached
 from app.services.voe_client import AutocompleteItem, VOEDataClient
+from app.services.widget_service import generate_user_loader_js
 
 logger = logging.getLogger(__name__)
 
@@ -108,6 +109,56 @@ def setup_routers(
         await message.answer(text, parse_mode="HTML", reply_markup=main_reply_keyboard())
 
     # -------------------------------------------------------------------------
+    # Прихована команда /widget (iOS Scriptable Lock Screen & Home Screen Widget)
+    # -------------------------------------------------------------------------
+    @router.message(Command("widget"))
+    async def cmd_widget(message: Message) -> None:
+        if not message.from_user:
+            return
+        user = await db.upsert_user(
+            telegram_id=message.from_user.id,
+            username=message.from_user.username,
+            first_name=message.from_user.first_name,
+        )
+        locations = await db.get_user_locations(user.telegram_id)
+        default_loc_id = locations[0].id if locations else None
+
+        # Дозволяємо передати кастомний URL сервера аргументом для тестування: /widget https://...
+        raw_text = (message.text or "").strip()
+        parts = raw_text.split(maxsplit=1)
+        custom_base_url: Optional[str] = None
+        if len(parts) > 1 and parts[1].startswith(("http://", "https://")):
+            custom_base_url = parts[1].strip()
+
+        js_bytes = generate_user_loader_js(
+            user_id=user.telegram_id,
+            base_url=custom_base_url,
+            default_location_id=default_loc_id,
+        )
+        doc = BufferedInputFile(js_bytes, filename="Svitlo.js")
+
+        loc_note = (
+            f"📍 За замовчуванням: <b>{locations[0].label} (Черга {locations[0].queue})</b>\n"
+            if locations
+            else "📍 За замовчуванням: <b>Черга 3.2</b> (додайте власну локацію в меню бота)\n"
+        )
+
+        caption = (
+            "📱 <b>Ваш персональний iOS-віджет (Scriptable) готовий!</b>\n\n"
+            f"{loc_note}\n"
+            "<b>Інструкція зі встановлення:</b>\n"
+            "1️⃣ Завантажте безкоштовний додаток <a href=\"https://apps.apple.com/app/scriptable/id1405459188\">Scriptable</a> з App Store.\n"
+            "2️⃣ Натисніть на файл <code>Svitlo.js</code> вище ➡️ <b>Поділитися (Share)</b> ➡️ оберіть <b>Scriptable</b> (<i>Add to Scriptable</i>).\n"
+            "3️⃣ Додайте віджет <b>Scriptable</b> на Екран блокування (Lock Screen) або Домашній екран та оберіть у його налаштуваннях скрипт <b>Svitlo</b>.\n\n"
+            "💡 <i>Підказка:</i> Якщо у вас декілька локацій, ви можете вказати іншу чергу (напр. <code>2.1</code>) або назву локації (напр. <code>Робота</code>) у полі <b>Parameter</b> налаштувань віджета."
+        )
+        await message.answer_document(
+            document=doc,
+            caption=caption,
+            parse_mode="HTML",
+        )
+
+    # -------------------------------------------------------------------------
     # Головне меню: Графік на сьогодні / на завтра
     # -------------------------------------------------------------------------
     @router.message(F.text == BTN_TODAY)
@@ -158,19 +209,23 @@ def setup_routers(
         loc: UserLocation, target_date: date, force_refresh: bool = False
     ) -> Optional[DaySchedule]:
         today = datetime.now(settings.tz).date()
+
+        # 1. Завантажуємо свіжі дані з GitHub JSON дзеркала + bezsvitla.com.ua
+        # (при звичайному запиті використовуємо 30-секундний in-memory кеш, при force_refresh — 0 с)
+        all_github = await voe_client.fetch_all_queues_from_github(
+            ttl_seconds=0.0 if force_refresh else 30.0
+        )
+        for (_, d), s in all_github.items():
+            if d > today and s.total_outage_minutes == 0:
+                continue
+            await _save_schedule(s)
+
         if not force_refresh:
             cached = await db.get_schedule(loc.queue, target_date)
             if cached:
                 if target_date > today and cached.total_outage_minutes == 0:
                     return None
                 return cached
-
-        # 1. Спробуємо завантажити з GitHub JSON дзеркала
-        all_github = await voe_client.fetch_all_queues_from_github()
-        for (_, d), s in all_github.items():
-            if d > today and s.total_outage_minutes == 0:
-                continue
-            await _save_schedule(s)
 
         if (loc.queue, target_date) in all_github:
             cand = all_github[(loc.queue, target_date)]
