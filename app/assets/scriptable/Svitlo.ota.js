@@ -235,7 +235,7 @@ function buildSmallWidget(data) {
   const changeDate = parseNextChangeDate(data);
   if (changeDate) {
     const timerTxt = midStack.addDate(changeDate);
-    timerTxt.applyTimerStyle();
+    timerTxt.applyRelativeStyle();
     timerTxt.font = Font.boldSystemFont(22);
     timerTxt.textColor = t.primary;
     timerTxt.lineLimit = 1;
@@ -318,7 +318,7 @@ function buildMediumWidget(data) {
   const changeDate = parseNextChangeDate(data);
   if (changeDate) {
     const mainCountdown = leftCol.addDate(changeDate);
-    mainCountdown.applyTimerStyle();
+    mainCountdown.applyRelativeStyle();
     mainCountdown.font = Font.boldSystemFont(30);
     mainCountdown.textColor = t.primary;
     mainCountdown.lineLimit = 1;
@@ -416,7 +416,7 @@ function buildRectangularWidget(data) {
   const changeDate = parseNextChangeDate(data);
   if (changeDate) {
     const cdTxt = col.addDate(changeDate);
-    cdTxt.applyTimerStyle();
+    cdTxt.applyRelativeStyle();
     cdTxt.font = Font.boldSystemFont(19);
     cdTxt.textColor = Color.white();
     cdTxt.lineLimit = 1;
@@ -469,7 +469,7 @@ function buildCircularWidget(data) {
   const changeDate = parseNextChangeDate(data);
   if (changeDate) {
     const timerTxt = stack.addDate(changeDate);
-    timerTxt.applyTimerStyle();
+    timerTxt.applyRelativeStyle();
     timerTxt.font = Font.boldSystemFont(9);
     timerTxt.textOpacity = 0.85;
     timerTxt.minimumScaleFactor = 0.6;
