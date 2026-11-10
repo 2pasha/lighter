@@ -67,6 +67,10 @@ async function SvitloWidgetRunner(ctx) {
     } catch (e) {}
   }
 
+  // Якщо момент зміни вже минув (кеш / iOS запізнився / сервер відповів за мить до зміни),
+  // перемикаємось на заздалегідь порахований сервером наступний стан.
+  data = projectToCurrentState(data);
+
   const family = config.widgetFamily || "small";
   let widget;
 
@@ -84,13 +88,16 @@ async function SvitloWidgetRunner(ctx) {
     widget = buildSmallWidget(data);
   }
 
-  // Розумне планування наступного фонового оновлення (кожні 15 хв або одразу після зміни слоту)
+  // Розумне планування наступного фонового оновлення (кожні 15 хв або одразу після зміни слоту).
+  // Важливо: iOS не може сам змінити вигляд віджета — після 0 відлік relative-дати
+  // починає рахувати вгору, доки скрипт не перезапуститься. Тому просимо оновлення
+  // саме на момент зміни, навіть якщо до неї лишились лічені секунди.
   const nowMs = Date.now();
   let nextRefreshMs = nowMs + 15 * 60 * 1000;
   const changeDate = parseNextChangeDate(data);
   if (changeDate) {
-    const changeMs = changeDate.getTime() + 10 * 1000;
-    if (changeMs > nowMs + 30 * 1000 && changeMs < nextRefreshMs) {
+    const changeMs = Math.max(changeDate.getTime() + 2 * 1000, nowMs + 5 * 1000);
+    if (changeMs < nextRefreshMs) {
       nextRefreshMs = changeMs;
     }
   }
@@ -110,6 +117,19 @@ function parseNextChangeDate(data) {
   if (isNaN(d.getTime())) return null;
   if (d.getTime() <= Date.now()) return null;
   return d;
+}
+
+// Повертає дані для поточного моменту: якщо nextChangeAt уже минув і сервер
+// надіслав `upcoming` (стан після зміни), підставляємо його замість застарілого.
+function projectToCurrentState(data) {
+  if (!data || !data.nextChangeAt || !data.upcoming) return data;
+  const changeMs = new Date(data.nextChangeAt).getTime();
+  if (isNaN(changeMs) || changeMs > Date.now()) return data;
+  return Object.assign({}, data.upcoming, {
+    locationLabel: data.upcoming.locationLabel || data.locationLabel,
+    updatedAtLocal: data.updatedAtLocal,
+    _fromCache: data._fromCache,
+  });
 }
 
 function formatDynamicCountdownUk(data) {

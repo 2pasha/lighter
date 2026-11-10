@@ -112,6 +112,7 @@ def build_widget_payload(
     now: datetime,
     location_label: Optional[str] = None,
     include_possible: bool = True,
+    _with_upcoming: bool = True,
 ) -> dict[str, Any]:
     """Формує JSON-відповідь для GET /api/widget/data."""
     cur_min = now.hour * 60 + now.minute
@@ -133,6 +134,7 @@ def build_widget_payload(
 
     now_utc = now.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     next_change_at_iso = ""
+    upcoming: Optional[dict[str, Any]] = None
     if diff_minutes is not None:
         # Точний момент наступної зміни (від початку поточної хвилини + diff_minutes)
         now_minute_floor = now.replace(second=0, microsecond=0)
@@ -141,7 +143,26 @@ def build_widget_payload(
             "%Y-%m-%dT%H:%M:%SZ"
         )
 
-    return {
+        # Стан ПІСЛЯ наступної зміни: віджет зможе сам перемкнутися на нього,
+        # якщо iOS перезапустить скрипт без мережі або з кешованими даними.
+        if _with_upcoming:
+            if target_dt.date() == now.date():
+                up_today, up_tomorrow = today_sched, tomorrow_sched
+            elif target_dt.date() == now.date() + timedelta(days=1):
+                up_today, up_tomorrow = tomorrow_sched, None
+            else:
+                up_today, up_tomorrow = None, None
+            if up_today is not None:
+                upcoming = build_widget_payload(
+                    today_sched=up_today,
+                    tomorrow_sched=up_tomorrow,
+                    now=target_dt,
+                    location_label=location_label,
+                    include_possible=include_possible,
+                    _with_upcoming=False,
+                )
+
+    payload: dict[str, Any] = {
         "status": status,
         "slotState": cur_slot_state.value,
         "statusLabelUk": cur_slot_state.label_ua,
@@ -158,6 +179,9 @@ def build_widget_payload(
         "updatedAtLocal": now.strftime("%H:%M"),
         "lastUpdated": now_utc,
     }
+    if upcoming is not None:
+        payload["upcoming"] = upcoming
+    return payload
 
 
 async def resolve_widget_data(
