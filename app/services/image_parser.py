@@ -24,11 +24,13 @@ except ImportError:
 ASSETS_DIR = Path(__file__).resolve().parent.parent / "assets"
 FONTS_DIR = ASSETS_DIR / "fonts"
 AVATAR_PATH = ASSETS_DIR / "bot_avatar.png"
+AVATAR_POSSIBLE_PATH = ASSETS_DIR / "bot_avatar_possible.png"
+AVATAR_OUTAGE_PATH = ASSETS_DIR / "bot_avatar_outage.png"
 
 _FONT_CACHE: dict[tuple[str, int, str], Any] = {}
-_AVATAR_CACHE: dict[int, tuple[Any, Any]] = {}
+_AVATAR_CACHE: dict[tuple[int, str], tuple[Any, Any]] = {}
 _NOTIFICATION_IMAGE_CACHE: dict[tuple[str, Optional[str], int], bytes] = {}
-_SCHEDULE_IMAGE_CACHE: dict[tuple[str, str, str, Optional[int], int], bytes] = {}
+_SCHEDULE_IMAGE_CACHE: dict[tuple[str, str, str, Optional[int], str, int], bytes] = {}
 _SCHEDULE_CACHE_MAX_SIZE = 64
 
 
@@ -184,8 +186,12 @@ def render_schedule_image(
 
     if now is None:
         now = datetime.now(settings.tz)
-    current_hour: Optional[int] = (
-        now.hour if now.date() == schedule.schedule_date else None
+    is_today = now.date() == schedule.schedule_date
+    current_hour: Optional[int] = now.hour if is_today else None
+    current_slot_state: SlotState = (
+        schedule.state_at_minute(now.hour * 60 + now.minute)
+        if is_today
+        else SlotState.ON
     )
 
     cache_key = (
@@ -193,6 +199,7 @@ def render_schedule_image(
         schedule.schedule_date.isoformat(),
         schedule.content_hash,
         current_hour,
+        current_slot_state.value,
         scale,
     )
     cached = _SCHEDULE_IMAGE_CACHE.get(cache_key)
@@ -233,7 +240,9 @@ def render_schedule_image(
     # -------------------------------------------------------------------------
     # 1. Верхній рядок: Аватар бота (48×48) + "ГРАФІК ВІДКЛЮЧЕНЬ" та бейдж "Черга X.Y"
     # -------------------------------------------------------------------------
-    _paste_circular_avatar(im, x=36 * s, y=36 * s, size=48 * s)
+    _paste_circular_avatar(
+        im, x=36 * s, y=36 * s, size=48 * s, state=current_slot_state
+    )
 
     _draw_tracked_text(
         draw,
@@ -517,8 +526,16 @@ def render_notification_image(
     font_title = _get_font("Manrope", 30 * s, "Bold")
     font_desc = _get_font("Inter", 16 * s, "Regular")
 
-    # 1. Круглий аватар бота зліва зверху (64×64, x=28, y=28)
-    _paste_circular_avatar(im, x=28 * s, y=28 * s, size=64 * s)
+    # 1. Круглий аватар бота зліва зверху (64×64, x=28, y=28) відповідно до стану
+    if kind == "outage_soon":
+        notif_avatar_state = (
+            SlotState.OFF if slot_state == SlotState.OFF else SlotState.POSSIBLE_OFF
+        )
+    else:
+        notif_avatar_state = SlotState.ON
+    _paste_circular_avatar(
+        im, x=28 * s, y=28 * s, size=64 * s, state=notif_avatar_state
+    )
 
     # 2. Бейдж типу повідомлення справа зверху (y=47, height=26, radius=6, padding=[7, 10])
     badge_letter_spacing = 0.4 * s
@@ -570,23 +587,37 @@ def render_notification_image(
     return result_bytes
 
 
+def _get_avatar_path_for_state(state: SlotState) -> Path:
+    if state == SlotState.OFF and AVATAR_OUTAGE_PATH.exists():
+        return AVATAR_OUTAGE_PATH
+    if state == SlotState.POSSIBLE_OFF and AVATAR_POSSIBLE_PATH.exists():
+        return AVATAR_POSSIBLE_PATH
+    return AVATAR_PATH
+
+
 def _paste_circular_avatar(
-    base_im: Image.Image, x: int, y: int, size: int
+    base_im: Image.Image,
+    x: int,
+    y: int,
+    size: int,
+    state: SlotState = SlotState.ON,
 ) -> None:
-    """Малює круглий аватар бота у заданій позиції (x, y) з розміром size×size."""
-    cached_pair = _AVATAR_CACHE.get(size)
+    """Малює круглий аватар бота у заданій позиції (x, y) з розміром size×size залежно від стану."""
+    cache_key = (size, state.value)
+    cached_pair = _AVATAR_CACHE.get(cache_key)
     if cached_pair is not None:
         white_bg, mask = cached_pair
         base_im.paste(white_bg, (x, y), mask)
         return
 
     resample = getattr(Image, "Resampling", Image).LANCZOS
-    if AVATAR_PATH.exists():
+    target_path = _get_avatar_path_for_state(state)
+    if target_path.exists():
         try:
-            av = Image.open(AVATAR_PATH).convert("RGBA")
+            av = Image.open(target_path).convert("RGBA")
             av = av.resize((size, size), resample=resample)
         except Exception as exc:
-            logger.debug("Could not load avatar %s: %s", AVATAR_PATH, exc)
+            logger.debug("Could not load avatar %s: %s", target_path, exc)
             av = _draw_fallback_avatar(size)
     else:
         av = _draw_fallback_avatar(size)
@@ -601,7 +632,7 @@ def _paste_circular_avatar(
     # Накладаємо на білу підкладку перед вставкою з круглою маскою
     white_bg = Image.new("RGB", (size, size), (255, 255, 255))
     white_bg.paste(av.convert("RGB"), (0, 0), av.split()[3] if av.mode == "RGBA" else None)
-    _AVATAR_CACHE[size] = (white_bg, mask)
+    _AVATAR_CACHE[cache_key] = (white_bg, mask)
     base_im.paste(white_bg, (x, y), mask)
 
 

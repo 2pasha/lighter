@@ -624,7 +624,14 @@ class TestSvitloBotCore(unittest.TestCase):
         from PIL import Image
 
         ota_text = ota_bytes.decode("utf-8")
-        for const_name in ("AVATAR_B64", "AVATAR_LS_B64"):
+        for const_name in (
+            "AVATAR_B64",
+            "AVATAR_LS_B64",
+            "AVATAR_POSSIBLE_B64",
+            "AVATAR_POSSIBLE_LS_B64",
+            "AVATAR_OUTAGE_B64",
+            "AVATAR_OUTAGE_LS_B64",
+        ):
             match = re.search(rf'const {const_name} = "([^"]+)";', ota_text)
             self.assertIsNotNone(match, f"Missing {const_name} in Svitlo.ota.js")
             raw_png = base64.b64decode(match.group(1))
