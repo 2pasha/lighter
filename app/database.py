@@ -98,6 +98,7 @@ class Database:
         ).strip()
         self._pg_pool: Optional[Any] = None
         self._http_client: Optional[httpx.AsyncClient] = None
+        self._schedule_cache: dict[tuple[str, str], DaySchedule] = {}
 
     @property
     def is_supabase_rest(self) -> bool:
@@ -854,10 +855,85 @@ class Database:
     # -------------------------------------------------------------------------
     # Schedules
     # -------------------------------------------------------------------------
+    def _cache_schedule_in_memory(self, sched: DaySchedule) -> None:
+        if len(self._schedule_cache) > 256:
+            oldest = next(iter(self._schedule_cache))
+            self._schedule_cache.pop(oldest, None)
+        self._schedule_cache[(sched.queue, sched.schedule_date.isoformat())] = sched
+
+    async def prefetch_schedules_for_dates(
+        self, dates: list[date]
+    ) -> dict[tuple[str, date], DaySchedule]:
+        """Пакетно завантажує графіки для вказаних дат за 1 запит і прогреває in-memory кеш."""
+        if not dates:
+            return {}
+        date_strs = sorted({d.isoformat() for d in dates})
+        result: dict[tuple[str, date], DaySchedule] = {}
+
+        if self.is_supabase_rest:
+            client = self._get_http_client()
+            in_expr = "(" + ",".join(f'"{ds}"' for ds in date_strs) + ")"
+            resp = await client.get(
+                "/schedules",
+                params={"schedule_date": f"in.{in_expr}"},
+            )
+            resp.raise_for_status()
+            for row in resp.json():
+                sched = DaySchedule.from_json(
+                    queue=str(row["queue"]),
+                    schedule_date=date.fromisoformat(str(row["schedule_date"])),
+                    slots_json=str(row["slots_json"]),
+                    source=str(row["source"]),
+                )
+                self._cache_schedule_in_memory(sched)
+                result[(sched.queue, sched.schedule_date)] = sched
+            return result
+
+        if self.is_postgres:
+            pool = await self._get_pg_pool()
+            async with pool.acquire() as conn:
+                rows = await conn.fetch(
+                    "SELECT * FROM schedules WHERE schedule_date = ANY($1::text[])",
+                    date_strs,
+                )
+                for row in rows:
+                    sched = DaySchedule.from_json(
+                        queue=str(row["queue"]),
+                        schedule_date=date.fromisoformat(str(row["schedule_date"])),
+                        slots_json=str(row["slots_json"]),
+                        source=str(row["source"]),
+                    )
+                    self._cache_schedule_in_memory(sched)
+                    result[(sched.queue, sched.schedule_date)] = sched
+            return result
+
+        placeholders = ",".join("?" for _ in date_strs)
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                f"SELECT * FROM schedules WHERE schedule_date IN ({placeholders})",
+                tuple(date_strs),
+            ) as cursor:
+                rows = await cursor.fetchall()
+                for row in rows:
+                    sched = DaySchedule.from_json(
+                        queue=row["queue"],
+                        schedule_date=date.fromisoformat(row["schedule_date"]),
+                        slots_json=row["slots_json"],
+                        source=row["source"],
+                    )
+                    self._cache_schedule_in_memory(sched)
+                    result[(sched.queue, sched.schedule_date)] = sched
+        return result
+
     async def get_schedule(
         self, queue: str, schedule_date: date
     ) -> Optional[DaySchedule]:
         date_str = schedule_date.isoformat()
+        cached = self._schedule_cache.get((queue, date_str))
+        if cached is not None:
+            return cached
+
         if self.is_supabase_rest:
             client = self._get_http_client()
             resp = await client.get(
@@ -869,12 +945,14 @@ class Database:
             if not rows:
                 return None
             row = rows[0]
-            return DaySchedule.from_json(
+            sched = DaySchedule.from_json(
                 queue=str(row["queue"]),
                 schedule_date=date.fromisoformat(str(row["schedule_date"])),
                 slots_json=str(row["slots_json"]),
                 source=str(row["source"]),
             )
+            self._cache_schedule_in_memory(sched)
+            return sched
 
         if self.is_postgres:
             pool = await self._get_pg_pool()
@@ -886,12 +964,14 @@ class Database:
                 )
                 if not row:
                     return None
-                return DaySchedule.from_json(
+                sched = DaySchedule.from_json(
                     queue=str(row["queue"]),
                     schedule_date=date.fromisoformat(str(row["schedule_date"])),
                     slots_json=str(row["slots_json"]),
                     source=str(row["source"]),
                 )
+                self._cache_schedule_in_memory(sched)
+                return sched
 
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
@@ -902,12 +982,14 @@ class Database:
                 row = await cursor.fetchone()
                 if not row:
                     return None
-                return DaySchedule.from_json(
+                sched = DaySchedule.from_json(
                     queue=row["queue"],
                     schedule_date=date.fromisoformat(row["schedule_date"]),
                     slots_json=row["slots_json"],
                     source=row["source"],
                 )
+                self._cache_schedule_in_memory(sched)
+                return sched
 
     async def save_schedule(
         self, schedule: DaySchedule
@@ -961,6 +1043,7 @@ class Database:
                 headers={"Prefer": "resolution=merge-duplicates"},
             )
             resp.raise_for_status()
+            self._cache_schedule_in_memory(schedule)
             return True, existing
 
         if self.is_postgres:
@@ -982,6 +1065,7 @@ class Database:
                     schedule.content_hash,
                     schedule.source,
                 )
+            self._cache_schedule_in_memory(schedule)
             return True, existing
 
         async with aiosqlite.connect(self.db_path) as db:
@@ -1005,6 +1089,7 @@ class Database:
             )
             await db.commit()
 
+        self._cache_schedule_in_memory(schedule)
         return True, existing
 
     # -------------------------------------------------------------------------

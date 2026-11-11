@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import io
 import logging
 import re
+import time
 from datetime import date, datetime, timedelta
 from typing import Optional
 
@@ -55,6 +57,21 @@ def setup_routers(
             await notifier.save_and_notify_if_changed(s)
         else:
             await db.save_schedule(s)
+
+    async def _save_other_schedules_bg(
+        schedules_map: dict[tuple[str, date], DaySchedule],
+        skip_key: tuple[str, date],
+        today: date,
+    ) -> None:
+        try:
+            for (q, d), s in schedules_map.items():
+                if (q, d) == skip_key:
+                    continue
+                if d > today and s.total_outage_minutes == 0:
+                    continue
+                await _save_schedule(s)
+        except Exception as exc:
+            logger.debug("Background schedule save error: %s", exc)
 
     # -------------------------------------------------------------------------
     # /start та /help
@@ -178,7 +195,9 @@ def setup_routers(
     async def _send_schedules_for_day(
         message: Message, telegram_id: int, day_tag: str
     ) -> None:
+        t0 = time.perf_counter()
         locations = await db.get_user_locations(telegram_id)
+        t_locs = time.perf_counter()
         if not locations:
             await message.answer(
                 "📍 Ви ще не додали жодної локації. Додайте чергу або адресу:",
@@ -190,7 +209,9 @@ def setup_routers(
         target_date = now.date() if day_tag == "today" else now.date() + timedelta(days=1)
 
         for loc in locations:
+            t_sched0 = time.perf_counter()
             sched = await _get_or_fetch_schedule(loc, target_date, force_refresh=False)
+            t_sched1 = time.perf_counter()
             if not sched:
                 day_label = "сьогодні" if day_tag == "today" else "завтра"
                 await message.answer(
@@ -203,22 +224,53 @@ def setup_routers(
                 )
                 continue
 
-            await _reply_with_schedule_card(message, loc, sched, now, day_tag)
+            render_ms, send_ms = await _reply_with_schedule_card(
+                message, loc, sched, now, day_tag
+            )
+            total_ms = (time.perf_counter() - t0) * 1000.0
+            locs_ms = (t_locs - t0) * 1000.0
+            sched_ms = (t_sched1 - t_sched0) * 1000.0
+            logger.info(
+                "PERF | cmd=%s | user=%s | queue=%s | total=%.0fms "
+                "(db_locs=%.0fms, sched=%.0fms, render=%.0fms, tg_send=%.0fms)",
+                day_tag,
+                telegram_id,
+                loc.queue,
+                total_ms,
+                locs_ms,
+                sched_ms,
+                render_ms,
+                send_ms,
+            )
 
     async def _get_or_fetch_schedule(
         loc: UserLocation, target_date: date, force_refresh: bool = False
     ) -> Optional[DaySchedule]:
         today = datetime.now(settings.tz).date()
 
-        # 1. Завантажуємо свіжі дані з GitHub JSON дзеркала + bezsvitla.com.ua
-        # (при звичайному запиті використовуємо 30-секундний in-memory кеш, при force_refresh — 0 с)
+        # 1. Швидкий шлях (Cache-First): при звичайному натисканні кнопки одразу повертаємо
+        # актуальний графік із пам'яті/БД (фоновий планувальник оновлює всі черги кожні 5 хв)
+        if not force_refresh:
+            cached = await db.get_schedule(loc.queue, target_date)
+            if cached:
+                if target_date > today and cached.total_outage_minutes == 0:
+                    return None
+                return cached
+
+        # 2. Якщо в кеші/БД графіка ще немає або натиснуто «🔄 Оновити зараз» (force_refresh=True)
         all_github = await voe_client.fetch_all_queues_from_github(
-            ttl_seconds=0.0 if force_refresh else 30.0
+            ttl_seconds=0.0 if force_refresh else 60.0
         )
-        for (_, d), s in all_github.items():
-            if d > today and s.total_outage_minutes == 0:
-                continue
-            await _save_schedule(s)
+        target_key = (loc.queue, target_date)
+        if target_key in all_github:
+            cand = all_github[target_key]
+            if target_date <= today or cand.total_outage_minutes > 0:
+                await _save_schedule(cand)
+
+        if all_github:
+            asyncio.create_task(
+                _save_other_schedules_bg(all_github, skip_key=target_key, today=today)
+            )
 
         if not force_refresh:
             cached = await db.get_schedule(loc.queue, target_date)
@@ -227,12 +279,12 @@ def setup_routers(
                     return None
                 return cached
 
-        if (loc.queue, target_date) in all_github:
-            cand = all_github[(loc.queue, target_date)]
+        if target_key in all_github:
+            cand = all_github[target_key]
             if target_date <= today or cand.total_outage_minutes > 0:
                 return cand
 
-        # 2. Якщо локація має ID адреси — опитуємо сайт voe.com.ua/disconnection/detailed
+        # 3. Якщо локація має ID адреси — опитуємо сайт voe.com.ua/disconnection/detailed
         if loc.city_id and loc.street_id and loc.house_id:
             addr_res = await voe_client.fetch_by_address(
                 city_id=loc.city_id,
@@ -264,7 +316,8 @@ def setup_routers(
         sched: DaySchedule,
         now: datetime,
         day_tag: str,
-    ) -> None:
+    ) -> tuple[float, float]:
+        t_r0 = time.perf_counter()
         text = format_schedule_message(
             schedule=sched,
             location_label=loc.label,
@@ -273,6 +326,7 @@ def setup_routers(
         )
         img_bytes = render_schedule_image(sched, now=now)
         kb = schedule_view_actions_kb(loc.id, day_tag)
+        t_r1 = time.perf_counter()
 
         if img_bytes and len(text) <= 1000:
             fname = f"voe_{sched.queue}_{sched.schedule_date}.png"
@@ -306,6 +360,9 @@ def setup_routers(
                     await message.answer_photo(photo=photo)
             await message.answer(text, parse_mode="HTML", reply_markup=kb)
 
+        t_r2 = time.perf_counter()
+        return (t_r1 - t_r0) * 1000.0, (t_r2 - t_r1) * 1000.0
+
     # -------------------------------------------------------------------------
     # Callback-кнопки оновлення та перемикання сьогодні/завтра
     # -------------------------------------------------------------------------
@@ -316,8 +373,10 @@ def setup_routers(
         parts = call.data.split(":")
         if len(parts) < 4:
             return
+        t0 = time.perf_counter()
         action, loc_id_str, day_tag = parts[1], parts[2], parts[3]
         loc = await db.get_location_by_id(int(loc_id_str), call.from_user.id)
+        t_loc = time.perf_counter()
         if not loc:
             await call.answer("Локацію не знайдено", show_alert=True)
             return
@@ -330,7 +389,9 @@ def setup_routers(
         else:
             await call.answer()
 
+        t_sched0 = time.perf_counter()
         sched = await _get_or_fetch_schedule(loc, target_date, force_refresh=force)
+        t_sched1 = time.perf_counter()
         if not sched:
             day_label = "сьогодні" if day_tag == "today" else "завтра"
             await call.message.answer(
@@ -341,7 +402,23 @@ def setup_routers(
             )
             return
 
-        await _reply_with_schedule_card(call.message, loc, sched, now, day_tag)  # type: ignore
+        render_ms, send_ms = await _reply_with_schedule_card(
+            call.message, loc, sched, now, day_tag  # type: ignore
+        )
+        total_ms = (time.perf_counter() - t0) * 1000.0
+        logger.info(
+            "PERF | cb=sched:%s:%s | user=%s | queue=%s | total=%.0fms "
+            "(db_loc=%.0fms, sched=%.0fms, render=%.0fms, tg_send=%.0fms)",
+            action,
+            day_tag,
+            call.from_user.id,
+            loc.queue,
+            total_ms,
+            (t_loc - t0) * 1000.0,
+            (t_sched1 - t_sched0) * 1000.0,
+            render_ms,
+            send_ms,
+        )
 
     # -------------------------------------------------------------------------
     # Мої локації: перегляд, додавання, видалення

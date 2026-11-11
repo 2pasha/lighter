@@ -743,6 +743,61 @@ class TestSvitloBotCore(unittest.TestCase):
 
         asyncio.run(_run_http_test())
 
+    def test_schedule_cache_and_early_15min_warning_exit(self) -> None:
+        import asyncio
+        import tempfile
+        from unittest.mock import AsyncMock
+        from app.database import Database
+        from app.services.notifier import NotificationEngine
+        from app.services.voe_client import VOEDataClient
+
+        async def _run() -> None:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                db = Database(
+                    db_path=f"{tmpdir}/test_perf.db",
+                    database_url="",
+                    supabase_url="",
+                    supabase_key="",
+                )
+                await db.init_db()
+
+                d_today = date(2026, 11, 11)
+                sched = DaySchedule.from_hourly("3.2", d_today, [SlotState.ON] * 24)
+                await db.save_schedule(sched)
+
+                # Перевіряємо, що графік одразу в in-memory кеші
+                self.assertIn(("3.2", "2026-11-11"), db._schedule_cache)
+                cached = await db.get_schedule("3.2", d_today)
+                self.assertIs(cached, sched)
+
+                # Пакетне завантаження prefetch_schedules_for_dates
+                db._schedule_cache.clear()
+                prefetched = await db.prefetch_schedules_for_dates([d_today])
+                self.assertIn(("3.2", d_today), prefetched)
+                self.assertIn(("3.2", "2026-11-11"), db._schedule_cache)
+
+                # Перевіряємо ранній вихід у check_15min_warnings поза вікном [14..16] хвилин
+                bot = AsyncMock()
+                voe_client = AsyncMock(spec=VOEDataClient)
+                engine = NotificationEngine(bot=bot, db=db, voe_client=voe_client)
+                db.get_all_active_subscriptions = AsyncMock(return_value=[])  # type: ignore
+
+                # О 10:05 до найближчої межі (10:30) 25 хвилин -> ранній вихід без запитів у БД
+                await engine.check_15min_warnings(
+                    now=datetime(2026, 11, 11, 10, 5, tzinfo=ZoneInfo("Europe/Kyiv"))
+                )
+                db.get_all_active_subscriptions.assert_not_called()
+
+                # О 10:15 до межі 10:30 рівно 15 хвилин -> перевірка підписок виконується
+                await engine.check_15min_warnings(
+                    now=datetime(2026, 11, 11, 10, 15, tzinfo=ZoneInfo("Europe/Kyiv"))
+                )
+                db.get_all_active_subscriptions.assert_called_once()
+
+                await db.close()
+
+        asyncio.run(_run())
+
 
 if __name__ == "__main__":
     unittest.main()

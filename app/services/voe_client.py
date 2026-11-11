@@ -551,21 +551,27 @@ class VOEDataClient:
         ):
             return dict(self._github_cache_data)
 
-        github_parsed: dict[tuple[str, date], DaySchedule] = {}
-        try:
-            client = self._get_client()
-            resp = await client.get(self.github_json_url, timeout=15.0)
-            resp.raise_for_status()
-            data = resp.json()
-            github_parsed = self.parse_github_json(data)
-        except Exception as exc:
-            logger.warning("GitHub JSON mirror fetch failed: %s", exc)
+        async def _fetch_github() -> dict[tuple[str, date], DaySchedule]:
+            try:
+                client = self._get_client()
+                resp = await client.get(self.github_json_url, timeout=15.0)
+                resp.raise_for_status()
+                data = resp.json()
+                return self.parse_github_json(data)
+            except Exception as exc:
+                logger.warning("GitHub JSON mirror fetch failed: %s", exc)
+                return {}
 
-        bezsvitla_parsed: dict[tuple[str, date], DaySchedule] = {}
-        try:
-            bezsvitla_parsed = await self.fetch_all_queues_from_bezsvitla()
-        except Exception as exc:
-            logger.warning("Direct bezsvitla.com.ua fetch failed: %s", exc)
+        async def _fetch_bezsvitla() -> dict[tuple[str, date], DaySchedule]:
+            try:
+                return await self.fetch_all_queues_from_bezsvitla()
+            except Exception as exc:
+                logger.warning("Direct bezsvitla.com.ua fetch failed: %s", exc)
+                return {}
+
+        github_parsed, bezsvitla_parsed = await asyncio.gather(
+            _fetch_github(), _fetch_bezsvitla()
+        )
 
         merged: dict[tuple[str, date], DaySchedule] = dict(github_parsed)
         # Прямий скрейпер bezsvitla.com.ua має свіжіші дані (без затримки GitHub Actions у 10+ хв)

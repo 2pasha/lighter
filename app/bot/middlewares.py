@@ -191,7 +191,23 @@ class AntiSpamMiddleware(BaseMiddleware):  # type: ignore[misc]
             callback_data=cb_data,
         )
         if allowed:
-            return await handler(event, data)
+            t_start = time.perf_counter()
+            try:
+                return await handler(event, data)
+            finally:
+                elapsed_ms = (time.perf_counter() - t_start) * 1000.0
+                if elapsed_ms >= 1000.0:
+                    ev_label = (
+                        f"cb:{cb_data}"
+                        if is_cb
+                        else f"msg:{(getattr(event, 'text', None) or '<media>')[:30]}"
+                    )
+                    logger.warning(
+                        "SLOW_HANDLER | user=%s | event=%s | duration=%.0fms",
+                        user.id,
+                        ev_label,
+                        elapsed_ms,
+                    )
 
         if should_warn:
             try:

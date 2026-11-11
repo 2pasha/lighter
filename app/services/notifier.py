@@ -140,12 +140,12 @@ class NotificationEngine:
         today = now.date()
         tomorrow = today + timedelta(days=1)
 
-        subscriptions = await self.db.get_all_active_subscriptions()
-        if not subscriptions:
-            logger.debug("No active subscriptions to poll.")
-            return
+        # Прогріваємо in-memory кеш графіків за 1 запит до БД
+        await self.db.prefetch_schedules_for_dates([today, tomorrow])
 
-        # 1. Завантажуємо глобальний JSON для всіх черг з GitHub-дзеркала
+        subscriptions = await self.db.get_all_active_subscriptions()
+
+        # 1. Завантажуємо глобальний JSON для всіх черг з GitHub-дзеркала + bezsvitla
         fetched_schedules = await self.voe_client.fetch_all_queues_from_github()
 
         # 2. Якщо для якихось активних локацій з адресою немає свіжих даних або треба перевірити сайт напряму
@@ -182,12 +182,15 @@ class NotificationEngine:
 
         # 4. Зберігаємо графіки в БД та визначаємо події (новий на завтра / зміна графіка)
         for (queue, sched_date), new_sched in fetched_schedules.items():
-            await self.save_and_notify_if_changed(new_sched, now=now)
+            await self.save_and_notify_if_changed(
+                new_sched, now=now, preloaded_subscriptions=subscriptions
+            )
 
     async def save_and_notify_if_changed(
         self,
         new_sched: DaySchedule,
         now: Optional[datetime] = None,
+        preloaded_subscriptions: Optional[list[tuple[UserProfile, UserLocation]]] = None,
     ) -> bool:
         """
         Зберігає новий графік у БД. Якщо графік змінився або з'явився новий на завтра,
@@ -218,7 +221,11 @@ class NotificationEngine:
             return False
 
         # Розсилаємо сповіщення всім підписникам цієї черги
-        subscriptions = await self.db.get_all_active_subscriptions()
+        subscriptions = (
+            preloaded_subscriptions
+            if preloaded_subscriptions is not None
+            else await self.db.get_all_active_subscriptions()
+        )
         matching_subs = [
             (user, loc) for user, loc in subscriptions if loc.queue == queue
         ]
@@ -388,12 +395,25 @@ class NotificationEngine:
         if now is None:
             now = datetime.now(settings.tz)
 
+        # Шукаємо точний час через 15 хвилин ПЕРЕД запитами до БД
+        target_dt = now + timedelta(minutes=15)
+        # Округлюємо до найближчої межі 30 хвилин, якщо ми у вікні [14..16] хвилин до переходу
+        for lead_min in (15, 14, 16):
+            cand_dt = now + timedelta(minutes=lead_min)
+            if cand_dt.minute in (0, 30):
+                target_dt = cand_dt
+                break
+        else:
+            # Зараз не ~15 хвилин до межі 00 або 30 хвилин — виходимо за 0 мс без звернень до БД
+            return
+
         subscriptions = await self.db.get_all_active_subscriptions()
         if not subscriptions:
             return
 
         today = now.date()
         tomorrow = today + timedelta(days=1)
+        await self.db.prefetch_schedules_for_dates([today, tomorrow])
 
         # Кешуємо графіки з БД для всіх потрібних черг
         queues = {loc.queue for _, loc in subscriptions}
@@ -407,18 +427,6 @@ class NotificationEngine:
             stm = await self.db.get_schedule(q, tomorrow)
             if stm:
                 schedules_tomorrow[q] = stm
-
-        # Шукаємо точний час через 15 хвилин
-        target_dt = now + timedelta(minutes=15)
-        # Округлюємо до найближчої межі 30 хвилин, якщо ми у вікні [14..16] хвилин до переходу
-        for lead_min in (15, 14, 16):
-            cand_dt = now + timedelta(minutes=lead_min)
-            if cand_dt.minute in (0, 30):
-                target_dt = cand_dt
-                break
-        else:
-            # Зараз не ~15 хвилин до межі 00 або 30 хвилин
-            return
 
         target_date = target_dt.date()
         target_slot_idx = (target_dt.hour * 60 + target_dt.minute) // 30

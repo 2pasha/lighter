@@ -441,7 +441,7 @@ def render_schedule_image(
         )
 
     buf = io.BytesIO()
-    im.save(buf, format="PNG", optimize=True)
+    im.save(buf, format="PNG", compress_level=1)
     result_bytes = buf.getvalue()
     if len(_SCHEDULE_IMAGE_CACHE) >= _SCHEDULE_CACHE_MAX_SIZE:
         oldest_key = next(iter(_SCHEDULE_IMAGE_CACHE))
@@ -581,7 +581,7 @@ def render_notification_image(
     )
 
     buf = io.BytesIO()
-    im.save(buf, format="PNG", optimize=True)
+    im.save(buf, format="PNG", compress_level=1)
     result_bytes = buf.getvalue()
     _NOTIFICATION_IMAGE_CACHE[notif_cache_key] = result_bytes
     return result_bytes
