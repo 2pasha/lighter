@@ -23,7 +23,10 @@ except ImportError:
 from app.config import ALL_QUEUES, settings
 from app.models import DaySchedule, SlotState
 from app.services.address_index import AddressIndex, download_and_build_voe_index
-from app.services.image_parser import parse_voe_schedule_image
+from app.services.image_parser import (
+    extract_header_queue_and_date,
+    parse_voe_schedule_image,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1232,6 +1235,12 @@ class VOEDataClient:
                 img_bytes = await client.download_media(msg.photo, file=bytes)
                 if img_bytes:
                     try:
+                        hdr_q, hdr_d = extract_header_queue_and_date(img_bytes)
+                        if hdr_q in ALL_QUEUES:
+                            q_from_text = hdr_q
+                        if hdr_d is not None:
+                            target_d = hdr_d
+
                         parsed = parse_voe_schedule_image(
                             img_bytes,
                             queue=q_from_text or "1.1",
@@ -1268,11 +1277,15 @@ class VOEDataClient:
                 ) as client:
                     bot_entity = await client.get_entity(settings.official_voe_bot_username)
 
-                    # 1. Перевіряємо останні повідомлення у чаті з @pat_voe_bot
+                    # 1. Перевіряємо останні повідомлення та свіжі фото графіків у чаті з @pat_voe_bot
                     recent_msgs = await client.get_messages(bot_entity, limit=25)
                     for msg in recent_msgs:
                         txt = (getattr(msg, "message", "") or "").strip()
                         if txt and _msg_matches_address(txt):
+                            res = await _extract_result_from_msg(client, msg)
+                            if res:
+                                return res
+                        elif getattr(msg, "photo", None):
                             res = await _extract_result_from_msg(client, msg)
                             if res:
                                 return res
@@ -1378,6 +1391,11 @@ class VOEDataClient:
                                     continue
                             img_bytes = await client.download_media(msg.photo, file=bytes)
                             if img_bytes:
+                                hdr_q, hdr_d = extract_header_queue_and_date(img_bytes)
+                                if hdr_q and hdr_q != q_norm:
+                                    continue
+                                if hdr_d and hdr_d != target_date:
+                                    continue
                                 parsed = parse_voe_schedule_image(
                                     img_bytes, queue=queue, schedule_date=target_date
                                 )

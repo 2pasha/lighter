@@ -113,16 +113,181 @@ def _decode_png_pure_python(
     return w, h, pixels
 
 
+def _extract_normalized_glyphs(
+    get_px: Any,
+    x0: int,
+    y0: int,
+    x1: int,
+    y1: int,
+    is_fg: Any,
+) -> list[tuple[int, int, int, int, list[int]]]:
+    """Виділяє зв'язні по X гліфи в прямокутнику та нормалізує кожен у бітову матрицю 16×24."""
+    cols: list[int] = []
+    for x in range(max(0, x0), max(0, x1)):
+        if any(is_fg(*get_px(x, y)) for y in range(max(0, y0), max(0, y1))):
+            cols.append(x)
+
+    segs: list[list[int]] = []
+    for x in cols:
+        if not segs or x > segs[-1][1] + 1:
+            segs.append([x, x])
+        else:
+            segs[-1][1] = x
+
+    glyphs: list[tuple[int, int, int, int, list[int]]] = []
+    for sx0, sx1 in segs:
+        ys = [
+            y
+            for y in range(max(0, y0), max(0, y1))
+            if any(is_fg(*get_px(x, y)) for x in range(sx0, sx1 + 1))
+        ]
+        if not ys:
+            continue
+        sy0, sy1 = min(ys), max(ys)
+        gw, gh = sx1 - sx0 + 1, sy1 - sy0 + 1
+        if gh < 4:
+            continue
+        norm: list[int] = []
+        for ny in range(24):
+            py = sy0 + int((ny + 0.5) * gh / 24)
+            py = min(sy1, max(sy0, py))
+            for nx in range(16):
+                px = sx0 + int((nx + 0.5) * gw / 16)
+                px = min(sx1, max(sx0, px))
+                norm.append(1 if is_fg(*get_px(px, py)) else 0)
+        glyphs.append((sx0, sx1, sy0, sy1, norm))
+    return glyphs
+
+
+def extract_header_queue_and_date(
+    image_bytes: bytes,
+) -> tuple[Optional[str], Optional[date]]:
+    """
+    Автоматично розпізнає номер черги (1.1..6.2) та дату (DD.MM.YYYY)
+    із синьої шапки офіційної картинки @pat_voe_bot («2.1 черга | 16.11.2026»).
+    Використовує самокалібровані шаблони цифр 0..9 із клітинок 00:00..09:00 тієї ж картинки.
+    """
+    try:
+        if HAS_PIL:
+            im = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+            w, h = im.size
+
+            def get_px(x: int, y: int) -> tuple[int, int, int]:
+                return im.getpixel((x, y))  # type: ignore
+        else:
+            w, h, px_grid = _decode_png_pure_python(image_bytes)
+
+            def get_px(x: int, y: int) -> tuple[int, int, int]:
+                return px_grid[y][x]
+
+        grid_x0 = int(w * (29.0 / 540.0))
+        grid_x1 = int(w * (510.0 / 540.0))
+        grid_y0 = int(h * (140.0 / 714.0))
+        grid_y1 = int(h * (557.0 / 714.0))
+        col_w = (grid_x1 - grid_x0) / 4.0
+        row_h = (grid_y1 - grid_y0) / 6.0
+
+        # 1. Будуємо еталонні шаблони цифр 0..9 з других цифр клітинок 00:00 .. 09:00
+        templates: dict[str, list[int]] = {}
+        for digit in range(10):
+            r_idx, c_idx = divmod(digit, 4)
+            cx0 = int(grid_x0 + c_idx * col_w + col_w * 0.12)
+            cx1 = int(grid_x0 + (c_idx + 1) * col_w - col_w * 0.12)
+            cy0 = int(grid_y0 + r_idx * row_h + row_h * 0.25)
+            cy1 = int(grid_y0 + (r_idx + 1) * row_h - row_h * 0.20)
+            cell_glyphs = _extract_normalized_glyphs(
+                get_px,
+                cx0,
+                cy0,
+                cx1,
+                cy1,
+                lambda r, g, b: r < 175 and g < 150 and b < 175,
+            )
+            if len(cell_glyphs) >= 2:
+                templates[str(digit)] = cell_glyphs[1][4]
+
+        if len(templates) < 6:
+            return None, None
+
+        # 2. Витягуємо білі символи з верхньої синьої плашки («2.1 черга | 16.11.2026»)
+        hdr_x0 = int(w * (36.0 / 540.0))
+        hdr_x1 = int(w * (504.0 / 540.0))
+        hdr_y0 = int(h * (52.0 / 714.0))
+        hdr_y1 = int(h * (94.0 / 714.0))
+        hdr_glyphs = _extract_normalized_glyphs(
+            get_px,
+            hdr_x0,
+            hdr_y0,
+            hdr_x1,
+            hdr_y1,
+            lambda r, g, b: r > 200 and g > 200 and b > 200,
+        )
+        if len(hdr_glyphs) < 3:
+            return None, None
+
+        def _match_digit(
+            norm: list[int], allowed: Optional[list[str]] = None
+        ) -> tuple[Optional[str], int]:
+            cands = [d for d in (allowed or list(templates.keys())) if d in templates]
+            best_d: Optional[str] = None
+            best_score = -1
+            for d in cands:
+                t = templates[d]
+                score = sum(1 for a, b in zip(norm, t) if a == b)
+                if score > best_score:
+                    best_score = score
+                    best_d = d
+            return best_d, best_score
+
+        q_maj, sc1 = _match_digit(hdr_glyphs[0][4], ["1", "2", "3", "4", "5", "6"])
+        q_min, sc2 = _match_digit(hdr_glyphs[2][4], ["1", "2"])
+        recognized_queue: Optional[str] = None
+        if q_maj and q_min and sc1 >= 260 and sc2 >= 260:
+            recognized_queue = f"{q_maj}.{q_min}"
+
+        recognized_date: Optional[date] = None
+        if len(hdr_glyphs) >= 15 and len(templates) == 10:
+            d1, _ = _match_digit(hdr_glyphs[-10][4])
+            d2, _ = _match_digit(hdr_glyphs[-9][4])
+            m1, _ = _match_digit(hdr_glyphs[-7][4])
+            m2, _ = _match_digit(hdr_glyphs[-6][4])
+            y1, _ = _match_digit(hdr_glyphs[-4][4])
+            y2, _ = _match_digit(hdr_glyphs[-3][4])
+            y3, _ = _match_digit(hdr_glyphs[-2][4])
+            y4, _ = _match_digit(hdr_glyphs[-1][4])
+            if all(v is not None for v in (d1, d2, m1, m2, y1, y2, y3, y4)):
+                day_val = int(f"{d1}{d2}")
+                month_val = int(f"{m1}{m2}")
+                year_val = int(f"{y1}{y2}{y3}{y4}")
+                if 2024 <= year_val <= 2035 and 1 <= month_val <= 12 and 1 <= day_val <= 31:
+                    recognized_date = date(year_val, month_val, day_val)
+
+        return recognized_queue, recognized_date
+    except Exception as exc:
+        logger.debug("Header OCR fallback skipped: %s", exc)
+        return None, None
+
+
 def parse_voe_schedule_image(
     image_bytes: bytes,
     queue: str = "1.1",
     schedule_date: Optional[date] = None,
+    auto_detect_header: bool = False,
 ) -> DaySchedule:
     """
     Розпізнає зображення графіка з офіційного бота @pat_voe_bot (сітка 6 рядків × 4 стовпчики = 24 години).
     Підтримує як цілі годинні клітинки, так і поділені навпіл (по 30 хвилин).
+    Якщо auto_detect_header=True, також автоматично зчитує чергу та дату із синьої шапки картинки.
     """
     target_date = schedule_date or date.today()
+    resolved_queue = queue
+
+    if auto_detect_header:
+        hdr_q, hdr_d = extract_header_queue_and_date(image_bytes)
+        if hdr_q:
+            resolved_queue = hdr_q
+        if hdr_d and schedule_date is None:
+            target_date = hdr_d
 
     if HAS_PIL:
         im = Image.open(io.BytesIO(image_bytes)).convert("RGB")
@@ -164,7 +329,7 @@ def parse_voe_schedule_image(
             slots.append(state_second_half)
 
     return DaySchedule(
-        queue=queue,
+        queue=resolved_queue,
         schedule_date=target_date,
         slots=slots,
         source="telegram_bot_image",

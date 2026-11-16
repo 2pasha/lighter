@@ -431,6 +431,7 @@ class TestSvitloBotCore(unittest.TestCase):
 
                 bot = AsyncMock()
                 voe_client = VOEDataClient()
+                voe_client.check_address_queue_via_telethon = AsyncMock(return_value=None)  # type: ignore
                 engine = NotificationEngine(bot=bot, db=db, voe_client=voe_client)
 
                 # 1. Початковий графік
@@ -862,6 +863,7 @@ class TestSvitloBotCore(unittest.TestCase):
 
                 bot = AsyncMock()
                 voe_client = VOEDataClient()
+                voe_client.check_address_queue_via_telethon = AsyncMock(return_value=None)  # type: ignore
                 engine = NotificationEngine(bot=bot, db=db, voe_client=voe_client)
 
                 now_dt = datetime(2026, 11, 16, 12, 0, tzinfo=ZoneInfo("Europe/Kyiv"))

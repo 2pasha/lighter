@@ -44,7 +44,11 @@ from app.config import ALL_QUEUES, settings
 from app.database import Database, UserLocation
 from app.models import DaySchedule
 from app.services.formatter import format_schedule_message
-from app.services.image_parser import parse_voe_schedule_image, render_schedule_image
+from app.services.image_parser import (
+    extract_header_queue_and_date,
+    parse_voe_schedule_image,
+    render_schedule_image,
+)
 from app.services.notifier import NotificationEngine, send_photo_cached
 from app.services.voe_client import AutocompleteItem, VOEDataClient
 from app.services.widget_service import generate_user_loader_js
@@ -1540,12 +1544,18 @@ def setup_routers(
             await bot.download(largest_photo, destination=buf)
             img_bytes = buf.getvalue()
 
+            hdr_q, hdr_d = extract_header_queue_and_date(img_bytes)
+            if not q_match and hdr_q in ALL_QUEUES:
+                queue = hdr_q
+            if not d_match and "завтра" not in caption.lower() and hdr_d is not None:
+                target_date = hdr_d
+
             parsed_sched = parse_voe_schedule_image(
                 img_bytes, queue=queue, schedule_date=target_date
             )
 
-            # Якщо в підписі не було вказано чергу — визначаємо її автоматично за 48-слотовим відбитком!
-            if not q_match:
+            # Якщо в підписі та шапці не було знайдено чергу — визначаємо її за 48-слотовим відбитком!
+            if not q_match and not hdr_q:
                 all_github = await voe_client.fetch_all_queues_from_github()
                 matched_q = voe_client.match_schedule_to_queue(parsed_sched, all_github)
                 if matched_q in ALL_QUEUES:
