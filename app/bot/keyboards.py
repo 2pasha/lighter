@@ -141,6 +141,14 @@ def locations_list_kb(locations: list[UserLocation]) -> InlineKeyboardMarkup:
                     text=f"📍 {loc.label} (Черга {loc.queue})",
                     callback_data=f"loc:view:{loc.id}",
                 ),
+            ]
+        )
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="🔢 Змінити чергу",
+                    callback_data=f"loc:chq:{loc.id}",
+                ),
                 InlineKeyboardButton(
                     text="🗑 Видалити",
                     callback_data=f"loc:del:{loc.id}",
@@ -155,6 +163,51 @@ def locations_list_kb(locations: list[UserLocation]) -> InlineKeyboardMarkup:
         ]
     )
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def change_location_queue_kb(loc: UserLocation) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    if loc.city_name:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="🔍 Перевірити актуальну чергу за адресою",
+                    callback_data=f"loc:verify:{loc.id}",
+                )
+            ]
+        )
+    for i in range(0, len(ALL_QUEUES), 4):
+        chunk = ALL_QUEUES[i : i + 4]
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"✅ {q}" if q == loc.queue else f"⚡ {q}",
+                    callback_data=f"loc:setq:{loc.id}:{q}",
+                )
+                for q in chunk
+            ]
+        )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="⬅️ Назад до локацій", callback_data="loc:list"
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def switch_queue_suggestion_kb(loc: UserLocation, new_queue: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=f"🔄 Перемкнути «{loc.label}» з {loc.queue} на {new_queue}",
+                    callback_data=f"loc:setq:{loc.id}:{new_queue}",
+                )
+            ]
+        ]
+    )
 
 
 def schedule_view_actions_kb(loc_id: int, day_tag: str = "today") -> InlineKeyboardMarkup:

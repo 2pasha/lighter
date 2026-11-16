@@ -15,7 +15,7 @@ except ImportError:
     TelegramRetryAfter = Exception  # type: ignore
     BufferedInputFile = Any  # type: ignore
 
-from app.config import settings
+from app.config import ALL_QUEUES, settings
 from app.database import Database, UserLocation, UserProfile
 from app.models import DaySchedule, OutageInterval, SlotState
 from app.services.formatter import (
@@ -148,13 +148,21 @@ class NotificationEngine:
         # 1. Завантажуємо глобальний JSON для всіх черг з GitHub-дзеркала + bezsvitla
         fetched_schedules = await self.voe_client.fetch_all_queues_from_github()
 
-        # 2. Якщо для якихось активних локацій з адресою немає свіжих даних або треба перевірити сайт напряму
+        # 2. Перевіряємо та синхронізуємо актуальні черги ГПВ для локацій з адресами
+        await self.sync_locations_queues(
+            subscriptions=subscriptions,
+            fetched_schedules=fetched_schedules,
+            now=now,
+        )
+
+        # 2b. Якщо для якихось активних локацій з адресою немає свіжих даних у глобальному JSON
         checked_queues_via_address: set[str] = set()
         for _, loc in subscriptions:
             if (
                 loc.city_id
                 and loc.street_id
                 and loc.house_id
+                and (loc.queue, today) not in fetched_schedules
                 and loc.queue not in checked_queues_via_address
             ):
                 checked_queues_via_address.add(loc.queue)
@@ -168,8 +176,7 @@ class NotificationEngine:
                 )
                 if addr_res and addr_res.schedules:
                     for d, sched in addr_res.schedules.items():
-                        sched.queue = loc.queue
-                        fetched_schedules[(loc.queue, d)] = sched
+                        fetched_schedules[(sched.queue, d)] = sched
 
         # 3. Опціональний fallback через офіційний бот @pat_voe_bot (якщо увімкнено Telethon)
         monitored_queues = {loc.queue for _, loc in subscriptions}
@@ -185,6 +192,171 @@ class NotificationEngine:
             await self.save_and_notify_if_changed(
                 new_sched, now=now, preloaded_subscriptions=subscriptions
             )
+
+    async def sync_locations_queues(
+        self,
+        subscriptions: Optional[list[tuple[UserProfile, UserLocation]]] = None,
+        fetched_schedules: Optional[dict[tuple[str, date], DaySchedule]] = None,
+        now: Optional[datetime] = None,
+    ) -> int:
+        """
+        Перевіряє актуальність черги ГПВ для збережених локацій з адресами
+        (через @pat_voe_bot Telethon, живу форму VOE та оновлений довідник адрес).
+        Якщо обленерго змінило чергу для адреси (наприклад, 3.2 -> 2.1):
+        - автоматично оновлює чергу локації в БД та в кеші адрес;
+        - надсилає користувачу пуш-сповіщення про зміну черги разом з актуальним графіком.
+        Повертає кількість оновлених локацій.
+        """
+        if now is None:
+            now = datetime.now(settings.tz)
+        today = now.date()
+
+        if subscriptions is None:
+            subscriptions = await self.db.get_all_active_subscriptions()
+        if not subscriptions:
+            return 0
+
+        # Групуємо підписки за унікальною адресою, щоб не опитувати одну й ту саму адресу двічі
+        addr_groups: dict[tuple[str, str, str], list[tuple[UserProfile, UserLocation]]] = {}
+        for user, loc in subscriptions:
+            if not loc.city_name or not (loc.street_name or loc.city_id):
+                continue
+            key = (
+                loc.city_name.strip().lower(),
+                (loc.street_name or "").strip().lower(),
+                (loc.house_num or "").strip().lower(),
+            )
+            addr_groups.setdefault(key, []).append((user, loc))
+
+        if not addr_groups:
+            return 0
+
+        updated_count = 0
+        for _, group in addr_groups.items():
+            _, sample_loc = group[0]
+            verified_q = await self.voe_client.verify_address_queue(
+                city_name=sample_loc.city_name or "",
+                street_name=sample_loc.street_name or "",
+                house_num=sample_loc.house_num or "",
+                city_id=sample_loc.city_id or "",
+                street_id=sample_loc.street_id or "",
+                house_id=sample_loc.house_id or "",
+                known_schedules=fetched_schedules,
+            )
+            if not verified_q and sample_loc.city_name:
+                verified_q = await self.db.lookup_cached_address(
+                    sample_loc.city_name,
+                    sample_loc.street_name,
+                    sample_loc.house_num,
+                )
+
+            if not verified_q or verified_q not in ALL_QUEUES:
+                continue
+
+            for user, loc in group:
+                if loc.queue == verified_q:
+                    continue
+
+                old_queue = loc.queue
+                updated_loc = await self.db.update_location_queue(
+                    loc_id=loc.id,
+                    telegram_id=user.telegram_id,
+                    new_queue=verified_q,
+                )
+                loc.queue = verified_q
+                if updated_loc:
+                    loc.house_id = updated_loc.house_id
+                updated_count += 1
+
+                logger.info(
+                    "Auto-updated queue for location id=%s (user=%s, address='%s'): %s -> %s",
+                    loc.id,
+                    user.telegram_id,
+                    loc.display_address,
+                    old_queue,
+                    verified_q,
+                )
+
+                sched_today = (
+                    fetched_schedules.get((verified_q, today))
+                    if fetched_schedules
+                    else None
+                )
+                if sched_today is None:
+                    sched_today = await self.db.get_schedule(verified_q, today)
+
+                await self._notify_queue_changed(
+                    user=user,
+                    loc=loc,
+                    old_queue=old_queue,
+                    new_queue=verified_q,
+                    schedule_today=sched_today,
+                    now=now,
+                )
+
+        return updated_count
+
+    async def _notify_queue_changed(
+        self,
+        user: UserProfile,
+        loc: UserLocation,
+        old_queue: str,
+        new_queue: str,
+        schedule_today: Optional[DaySchedule],
+        now: datetime,
+    ) -> None:
+        if not user.notify_changes:
+            return
+
+        now_time_str = now.strftime("%H:%M")
+        if user.quiet_hours_enabled and is_in_quiet_hours(
+            now_time_str, user.quiet_start, user.quiet_end
+        ):
+            return
+
+        alert_key = f"queue_changed:{now.date().isoformat()}:{loc.id}:{old_queue}->{new_queue}"
+        if await self.db.has_alert_been_sent(user.telegram_id, loc.id, alert_key):
+            return
+
+        header = (
+            f"⚡🔄 <b>Увага! Вінницяобленерго змінило чергу ГПВ для вашої адреси!</b>\n"
+            f"🔢 Черга змінилася: <b>{old_queue}</b> ➡️ <b>{new_queue}</b>\n"
+            f"<i>Ми автоматично перемкнули локацію «{loc.label}» на чергу <b>{new_queue}</b>.</i>"
+        )
+
+        if schedule_today is not None:
+            text = format_schedule_message(
+                schedule=schedule_today,
+                location_label=loc.label,
+                address_str=loc.display_address,
+                now=now,
+                header_prefix=header,
+            )
+            img_bytes = render_schedule_image(schedule_today, now=now)
+            sent = await self._send_schedule_notification(
+                user.telegram_id, text, img_bytes, schedule_today
+            )
+        else:
+            addr_line = (
+                f"\n🏠 Адреса: <b>{loc.display_address}</b>"
+                if loc.display_address != f"Черга {new_queue}"
+                else ""
+            )
+            text = (
+                f"{header}\n\n"
+                f"📍 Локація: <b>{loc.label}</b>{addr_line}\n"
+                f"🔢 Нова черга: <b>{new_queue}</b>"
+            )
+            img_bytes = render_notification_image("schedule_updated")
+            sent = await self._safe_send_alert(
+                user.telegram_id,
+                text,
+                img_bytes=img_bytes,
+                filename=f"queue_changed_{loc.id}_{new_queue}.png",
+            )
+
+        if sent:
+            await self.db.mark_alert_sent(user.telegram_id, loc.id, alert_key)
 
     async def save_and_notify_if_changed(
         self,

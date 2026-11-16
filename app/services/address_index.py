@@ -67,11 +67,11 @@ STREET_SYNONYMS = {
     "600-рiччя": "600-річчя",
 }
 
-# Verified address overrides from official portal disconnection.voe.com.ua
-# where VOE's published GPV PDF has gaps, exceptions or omitted house numbers
+# Verified address overrides from official portal disconnection.voe.com.ua / @pat_voe_bot
+# where VOE's published GPV PDF has gaps, exceptions or operational feeder switches
 KNOWN_ADDRESS_OVERRIDES: dict[tuple[str, str, str], str] = {
-    ("вінниця", "порика", "48"): "3.2",
-    ("вінниця", "василя порика", "48"): "3.2",
+    ("вінниця", "порика", "48"): "2.1",
+    ("вінниця", "василя порика", "48"): "2.1",
 }
 
 FIRST_NAMES = {
@@ -773,7 +773,37 @@ class AddressIndex:
         self.data: dict[str, Any] = {"cities": []}
         self._cities_by_id: dict[str, dict[str, Any]] = {}
         self._streets_by_id: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
+        self._runtime_overrides: dict[tuple[str, str, str], str] = dict(KNOWN_ADDRESS_OVERRIDES)
         self.load()
+
+    def set_address_override(
+        self, city_name: str, street_name: str, house_num: str, queue: str
+    ) -> None:
+        """Register or update a verified address->queue override in memory."""
+        c_bare = _strip_city_prefix(city_name)
+        st_bare = _strip_street_prefix(street_name)
+        st_no_init = _strip_street_initials(st_bare)
+        u_num, u_suf = _parse_house_token(house_num)
+        norm_h = f"{u_num}{u_suf}" if u_num is not None else _normalize_text(house_num).strip()
+        if not c_bare or not norm_h or not queue:
+            return
+        if st_bare:
+            self._runtime_overrides[(c_bare, st_bare, norm_h)] = queue
+        if st_no_init and st_no_init != st_bare:
+            self._runtime_overrides[(c_bare, st_no_init, norm_h)] = queue
+
+    def get_address_override(
+        self, city_name: str, street_name: str, house_num: str
+    ) -> str | None:
+        c_bare = _strip_city_prefix(city_name)
+        st_bare = _strip_street_prefix(street_name)
+        st_no_init = _strip_street_initials(st_bare)
+        u_num, u_suf = _parse_house_token(house_num)
+        norm_h = f"{u_num}{u_suf}" if u_num is not None else _normalize_text(house_num).strip()
+        return (
+            self._runtime_overrides.get((c_bare, st_bare, norm_h))
+            or self._runtime_overrides.get((c_bare, st_no_init, norm_h))
+        )
 
     def load(self) -> bool:
         if not self.index_path.exists():
@@ -919,12 +949,13 @@ class AddressIndex:
         records = st.get("records", [])
         u_num, u_suf = _parse_house_token(q_house)
 
-        # 0. Check verified address overrides from disconnection.voe.com.ua
+        # 0. Check verified address overrides from disconnection.voe.com.ua / @pat_voe_bot / runtime cache
         if city and u_num is not None:
             c_bare = _strip_city_prefix(city["name"])
             st_bare = _strip_street_prefix(st["name"])
             norm_h = f"{u_num}{u_suf}"
-            for (ov_c, ov_st, ov_h), ov_q in KNOWN_ADDRESS_OVERRIDES.items():
+            active_overrides = {**KNOWN_ADDRESS_OVERRIDES, **self._runtime_overrides}
+            for (ov_c, ov_st, ov_h), ov_q in active_overrides.items():
                 if ov_c == c_bare and ov_h == norm_h:
                     if ov_st in (st_bare, _strip_street_initials(st_bare)) or any(
                         ov_st == _strip_street_prefix(a) for a in st.get("aliases", [])

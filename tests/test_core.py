@@ -393,9 +393,9 @@ class TestSvitloBotCore(unittest.TestCase):
             ("Ладижин Суворова", "3.2"),
             ("Могилів-Подільський Полтавська", "3.1"),
             ("с. Побережне", "5.1"),
-            # Випадки для Порика: дедуплікація аліасів та верифікована черга 3.2 (disconnection.voe.com.ua)
-            ("Вінниця Порика 48", "3.2"),
-            ("Порика 48", "3.2"),
+            # Випадки для Порика: дедуплікація аліасів та верифікована черга 2.1 (disconnection.voe.com.ua / @pat_voe_bot)
+            ("Вінниця Порика 48", "2.1"),
+            ("Порика 48", "2.1"),
             ("Порика 50", "4.2"),
             ("Порика 27а", "3.2"),
             ("Порика 15", "6.2"),
@@ -797,6 +797,100 @@ class TestSvitloBotCore(unittest.TestCase):
                 await db.close()
 
         asyncio.run(_run())
+
+    def test_queue_sync_and_fingerprint_matching(self) -> None:
+        import asyncio
+        import tempfile
+        from unittest.mock import AsyncMock
+        from app.database import Database
+        from app.services.notifier import NotificationEngine
+        from app.services.voe_client import VOEDataClient
+
+        # 1. Перевірка витягування черги з тексту @pat_voe_bot
+        self.assertEqual(
+            VOEDataClient.extract_queue_from_text("Ваша адреса: вул. Порика, 48. Підчерга: 2.1"),
+            "2.1",
+        )
+        self.assertEqual(
+            VOEDataClient.extract_queue_from_text("Графік ГПВ на 16.11.2026 (3,2 черга)"),
+            "3.2",
+        )
+
+        # 2. Перевірка розпізнавання черги за 48-слотовим відбитком (fingerprint matching)
+        d_target = date(2026, 11, 16)
+        h_21 = [SlotState.ON] * 24
+        h_21[2] = SlotState.OFF
+        h_21[3] = SlotState.OFF
+        h_21[14] = SlotState.OFF
+
+        h_32 = [SlotState.ON] * 24
+        h_32[8] = SlotState.OFF
+        h_32[9] = SlotState.OFF
+        h_32[18] = SlotState.OFF
+
+        known = {
+            ("2.1", d_target): DaySchedule.from_hourly("2.1", d_target, h_21),
+            ("3.2", d_target): DaySchedule.from_hourly("3.2", d_target, h_32),
+        }
+        mystery_sched = DaySchedule.from_hourly("3.2", d_target, h_21)
+        matched_q = VOEDataClient.match_schedule_to_queue(mystery_sched, known)
+        self.assertEqual(matched_q, "2.1")
+
+        # 3. Перевірка автоматичної синхронізації черги та пуш-сповіщення при зміні 3.2 -> 2.1
+        async def _run_sync() -> None:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                db = Database(
+                    db_path=f"{tmpdir}/test_qsync.db",
+                    database_url="",
+                    supabase_url="",
+                    supabase_key="",
+                )
+                await db.init_db()
+                await db.upsert_user(777, username="poryka_user")
+                loc = await db.add_location(
+                    telegram_id=777,
+                    label="🏠 Дім",
+                    queue="3.2",
+                    city_name="м. Вінниця",
+                    city_id="c_0",
+                    street_name="вул. Василя Порика",
+                    street_id="c_0_s_100",
+                    house_num="48",
+                    house_id="c_0_s_100_h_48_3.2",
+                )
+                self.assertEqual(loc.queue, "3.2")
+
+                bot = AsyncMock()
+                voe_client = VOEDataClient()
+                engine = NotificationEngine(bot=bot, db=db, voe_client=voe_client)
+
+                now_dt = datetime(2026, 11, 16, 12, 0, tzinfo=ZoneInfo("Europe/Kyiv"))
+                updated_count = await engine.sync_locations_queues(
+                    fetched_schedules=known,
+                    now=now_dt,
+                )
+                self.assertEqual(updated_count, 1)
+
+                # Перевіряємо, що в БД локація автоматично перейшла на 2.1 і оновився house_id
+                reloaded_loc = await db.get_location_by_id(loc.id, 777)
+                self.assertIsNotNone(reloaded_loc)
+                self.assertEqual(reloaded_loc.queue, "2.1")
+                self.assertEqual(reloaded_loc.house_id, "c_0_s_100_h_48_2.1")
+
+                # Перевіряємо, що користувач отримав сповіщення про зміну черги
+                total_sent = bot.send_photo.call_count + bot.send_message.call_count
+                self.assertGreater(total_sent, 0)
+
+                # Повторний виклик не дублює оновлення чи сповіщення
+                updated_again = await engine.sync_locations_queues(
+                    fetched_schedules=known,
+                    now=now_dt,
+                )
+                self.assertEqual(updated_again, 0)
+
+                await db.close()
+
+        asyncio.run(_run_sync())
 
 
 if __name__ == "__main__":

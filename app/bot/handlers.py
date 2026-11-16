@@ -28,6 +28,7 @@ from app.bot.keyboards import (
     autocomplete_items_kb,
     broadcast_cancel_kb,
     broadcast_confirm_kb,
+    change_location_queue_kb,
     label_presets_kb,
     locations_list_kb,
     main_reply_keyboard,
@@ -35,6 +36,7 @@ from app.bot.keyboards import (
     queue_picker_kb,
     schedule_view_actions_kb,
     settings_kb,
+    switch_queue_suggestion_kb,
 )
 from app.bot.middlewares import AntiSpamMiddleware
 from app.bot.states import AddLocationStates, BroadcastStates, QuietHoursStates
@@ -269,6 +271,28 @@ def setup_routers(
         all_github = await voe_client.fetch_all_queues_from_github(
             ttl_seconds=0.0 if force_refresh else 60.0
         )
+
+        # Якщо натиснуто «🔄 Оновити зараз» і локація має адресу — перевіряємо, чи не змінилася черга
+        if force_refresh and loc.city_name and (loc.street_name or loc.city_id):
+            verified_q = await voe_client.verify_address_queue(
+                city_name=loc.city_name,
+                street_name=loc.street_name or "",
+                house_num=loc.house_num or "",
+                city_id=loc.city_id or "",
+                street_id=loc.street_id or "",
+                house_id=loc.house_id or "",
+                known_schedules=all_github,
+            )
+            if verified_q in ALL_QUEUES and verified_q != loc.queue:
+                updated_loc = await db.update_location_queue(
+                    loc_id=loc.id,
+                    telegram_id=loc.telegram_id,
+                    new_queue=verified_q,
+                )
+                loc.queue = verified_q
+                if updated_loc:
+                    loc.house_id = updated_loc.house_id
+
         target_key = (loc.queue, target_date)
         if target_key in all_github:
             cand = all_github[target_key]
@@ -493,6 +517,171 @@ def setup_routers(
                 parse_mode="HTML",
                 reply_markup=schedule_view_actions_kb(loc.id, "today"),
             )
+
+    @router.callback_query(F.data == "loc:list")
+    async def cb_loc_list(call: CallbackQuery) -> None:
+        if not call.from_user or not call.message:
+            return
+        await call.answer()
+        locations = await db.get_user_locations(call.from_user.id)
+        if not locations:
+            await call.message.edit_text(
+                "📍 У вас ще немає збережених локацій.\nОберіть спосіб додавання:",
+                reply_markup=add_location_method_kb(),
+            )
+            return
+        lines = ["📍 <b>Ваші підключені локації:</b>\n"]
+        for loc in locations:
+            addr_suffix = (
+                f" ({loc.display_address})"
+                if loc.display_address != f"Черга {loc.queue}"
+                else ""
+            )
+            lines.append(
+                f"• <b>{loc.label}</b> — Черга <b>{loc.queue}</b>{addr_suffix}"
+            )
+        lines.append("\nНатисніть на локацію для перегляду графіка або змініть чергу:")
+        await call.message.edit_text(
+            "\n".join(lines),
+            parse_mode="HTML",
+            reply_markup=locations_list_kb(locations),
+        )
+
+    @router.callback_query(F.data.startswith("loc:chq:"))
+    async def cb_loc_change_queue_menu(call: CallbackQuery) -> None:
+        if not call.data or not call.from_user or not call.message:
+            return
+        loc_id = int(call.data.split(":")[2])
+        loc = await db.get_location_by_id(loc_id, call.from_user.id)
+        if not loc:
+            await call.answer("Локацію не знайдено", show_alert=True)
+            return
+        await call.answer()
+        addr_line = (
+            f"\n🏠 Адреса: <b>{loc.display_address}</b>"
+            if loc.display_address != f"Черга {loc.queue}"
+            else ""
+        )
+        await call.message.edit_text(
+            f"🔢 <b>Зміна черги ГПВ для локації «{loc.label}»</b>{addr_line}\n"
+            f"Поточна черга: <b>{loc.queue}</b>\n\n"
+            "Оберіть нову чергу зі списку нижче або натисніть перевірку за адресою:",
+            parse_mode="HTML",
+            reply_markup=change_location_queue_kb(loc),
+        )
+
+    @router.callback_query(F.data.startswith("loc:verify:"))
+    async def cb_loc_verify_queue(call: CallbackQuery) -> None:
+        if not call.data or not call.from_user or not call.message:
+            return
+        loc_id = int(call.data.split(":")[2])
+        loc = await db.get_location_by_id(loc_id, call.from_user.id)
+        if not loc:
+            await call.answer("Локацію не знайдено", show_alert=True)
+            return
+
+        await call.answer("🔍 Перевіряю актуальну чергу за вашою адресою...")
+        all_github = await voe_client.fetch_all_queues_from_github()
+        verified_q = await voe_client.verify_address_queue(
+            city_name=loc.city_name or "",
+            street_name=loc.street_name or "",
+            house_num=loc.house_num or "",
+            city_id=loc.city_id or "",
+            street_id=loc.street_id or "",
+            house_id=loc.house_id or "",
+            known_schedules=all_github,
+        )
+        if not verified_q and loc.city_name:
+            verified_q = await db.lookup_cached_address(
+                loc.city_name, loc.street_name, loc.house_num
+            )
+
+        if not verified_q or verified_q not in ALL_QUEUES:
+            await call.message.edit_text(
+                f"⚠️ Не вдалося автоматично визначити чергу для адреси <b>{loc.display_address}</b>.\n"
+                "Будь ласка, оберіть актуальну чергу вручну:",
+                parse_mode="HTML",
+                reply_markup=change_location_queue_kb(loc),
+            )
+            return
+
+        if verified_q == loc.queue:
+            await call.message.edit_text(
+                f"✅ За даними довідника для <b>{loc.display_address}</b> встановлена черга <b>{loc.queue}</b>.\n\n"
+                "Якщо на сайті <code>disconnection.voe.com.ua</code> або в <code>@pat_voe_bot</code> вашу адресу перемкнули на іншу лінію, оберіть нову чергу нижче:",
+                parse_mode="HTML",
+                reply_markup=change_location_queue_kb(loc),
+            )
+            return
+
+        old_q = loc.queue
+        updated_loc = await db.update_location_queue(
+            loc_id=loc.id,
+            telegram_id=call.from_user.id,
+            new_queue=verified_q,
+        )
+        loc = updated_loc or loc
+        await call.message.edit_text(
+            f"⚡🔄 <b>Чергу оновлено!</b>\n"
+            f"📍 Локація: <b>{loc.label}</b> ({loc.display_address})\n"
+            f"🔢 Була черга: <b>{old_q}</b> ➡️ Нова черга: <b>{verified_q}</b>",
+            parse_mode="HTML",
+        )
+        now = datetime.now(settings.tz)
+        sched = await _get_or_fetch_schedule(loc, now.date(), force_refresh=False)
+        if sched:
+            await _reply_with_schedule_card(call.message, loc, sched, now, "today")  # type: ignore
+
+    @router.callback_query(F.data.startswith("loc:setq:"))
+    async def cb_loc_set_queue(call: CallbackQuery) -> None:
+        if not call.data or not call.from_user or not call.message:
+            return
+        parts = call.data.split(":")
+        if len(parts) < 4:
+            return
+        loc_id = int(parts[2])
+        new_queue = parts[3]
+        if new_queue not in ALL_QUEUES:
+            await call.answer("Невірна черга", show_alert=True)
+            return
+
+        loc = await db.get_location_by_id(loc_id, call.from_user.id)
+        if not loc:
+            await call.answer("Локацію не знайдено", show_alert=True)
+            return
+
+        old_queue = loc.queue
+        updated_loc = await db.update_location_queue(
+            loc_id=loc.id,
+            telegram_id=call.from_user.id,
+            new_queue=new_queue,
+        )
+        loc = updated_loc or loc
+
+        # Якщо локація має точну адресу — оновлюємо in-memory override та синхронізуємо сусідів
+        if loc.city_name and loc.street_name and loc.house_num:
+            voe_client.address_index.set_address_override(
+                loc.city_name, loc.street_name, loc.house_num, new_queue
+            )
+            if notifier is not None:
+                asyncio.create_task(notifier.sync_locations_queues())
+
+        await call.answer(f"✅ Чергу змінено на {new_queue}!")
+        try:
+            await call.message.edit_text(
+                f"✅ Для локації <b>{loc.label}</b> встановлено чергу <b>{new_queue}</b> (була {old_queue}).",
+                parse_mode="HTML",
+            )
+        except Exception:
+            await call.message.answer(
+                f"✅ Для локації <b>{loc.label}</b> встановлено чергу <b>{new_queue}</b> (була {old_queue}).",
+                parse_mode="HTML",
+            )
+
+        now = datetime.now(settings.tz)
+        sched = await _get_or_fetch_schedule(loc, now.date(), force_refresh=False)
+        if sched:
+            await _reply_with_schedule_card(call.message, loc, sched, now, "today")  # type: ignore
 
     @router.callback_query(F.data.startswith("loc:del:"))
     async def cb_loc_del(call: CallbackQuery) -> None:
@@ -1354,9 +1543,19 @@ def setup_routers(
             parsed_sched = parse_voe_schedule_image(
                 img_bytes, queue=queue, schedule_date=target_date
             )
+
+            # Якщо в підписі не було вказано чергу — визначаємо її автоматично за 48-слотовим відбитком!
+            if not q_match:
+                all_github = await voe_client.fetch_all_queues_from_github()
+                matched_q = voe_client.match_schedule_to_queue(parsed_sched, all_github)
+                if matched_q in ALL_QUEUES:
+                    queue = matched_q
+                    parsed_sched.queue = matched_q
+
             await _save_schedule(parsed_sched)
 
             # Якщо у користувача ще немає локації з цією чергою, пропонуємо або створюємо
+            suggest_switch_loc: Optional[UserLocation] = None
             if not locations:
                 await db.upsert_user(
                     telegram_id=message.from_user.id,
@@ -1369,16 +1568,33 @@ def setup_routers(
                     queue=queue,
                 )
             else:
-                loc = next((l for l in locations if l.queue == queue), locations[0])
+                exact_loc = next((l for l in locations if l.queue == queue), None)
+                if exact_loc:
+                    loc = exact_loc
+                else:
+                    loc = locations[0]
+                    suggest_switch_loc = loc
+
+            header_prefix = "📸✅ <b>Зображення графіка з @pat_voe_bot успішно розпізнано та збережено!</b>"
+            if suggest_switch_loc is not None:
+                header_prefix += (
+                    f"\n💡 <i>Розпізнаний графік відповідає черзі <b>{queue}</b> "
+                    f"(у локації «{suggest_switch_loc.label}» зараз встановлено <b>{suggest_switch_loc.queue}</b>).</i>"
+                )
 
             text = format_schedule_message(
                 schedule=parsed_sched,
                 location_label=loc.label,
                 address_str=loc.display_address,
                 now=now,
-                header_prefix="📸✅ <b>Зображення графіка з @pat_voe_bot успішно розпізнано та збережено!</b>",
+                header_prefix=header_prefix,
             )
-            await message.answer(text, parse_mode="HTML", reply_markup=main_reply_keyboard())
+            reply_kb = (
+                switch_queue_suggestion_kb(suggest_switch_loc, queue)
+                if suggest_switch_loc is not None
+                else main_reply_keyboard()
+            )
+            await message.answer(text, parse_mode="HTML", reply_markup=reply_kb)
         except Exception as exc:
             logger.exception("Failed to parse user photo: %s", exc)
             await message.answer(

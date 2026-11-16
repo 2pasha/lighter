@@ -688,6 +688,88 @@ class Database:
                 row = await cursor.fetchone()
                 return self._row_to_location(row) if row else None
 
+    async def update_location_queue(
+        self,
+        loc_id: int,
+        telegram_id: int,
+        new_queue: str,
+        new_house_id: Optional[str] = None,
+    ) -> Optional[UserLocation]:
+        """Оновлює чергу ГПВ для існуючої локації користувача та синхронізує кеш адрес."""
+        existing = await self.get_location_by_id(loc_id, telegram_id)
+        if not existing:
+            return None
+
+        updated_house_id = new_house_id if new_house_id is not None else existing.house_id
+        if (
+            new_house_id is None
+            and existing.house_id
+            and existing.house_id.endswith(f"_{existing.queue}")
+        ):
+            prefix = existing.house_id[: -len(existing.queue)]
+            updated_house_id = f"{prefix}{new_queue}"
+
+        if existing.city_name:
+            try:
+                await self.cache_address_queue(
+                    city_name=existing.city_name,
+                    street_name=existing.street_name,
+                    house_num=existing.house_num,
+                    queue=new_queue,
+                    city_id=existing.city_id,
+                    street_id=existing.street_id,
+                    house_id=updated_house_id,
+                )
+            except Exception as exc:
+                logger.debug("cache_address_queue skipped during update: %s", exc)
+
+        if self.is_supabase_rest:
+            client = self._get_http_client()
+            resp = await client.patch(
+                "/locations",
+                params={"id": f"eq.{loc_id}", "telegram_id": f"eq.{telegram_id}"},
+                json={"queue": new_queue, "house_id": updated_house_id},
+                headers={"Prefer": "return=representation"},
+            )
+            resp.raise_for_status()
+            rows = resp.json()
+            return self._row_to_location(rows[0]) if rows else None
+
+        if self.is_postgres:
+            pool = await self._get_pg_pool()
+            async with pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    """
+                    UPDATE locations
+                    SET queue = $1, house_id = $2
+                    WHERE id = $3 AND telegram_id = $4
+                    RETURNING *
+                    """,
+                    new_queue,
+                    updated_house_id,
+                    loc_id,
+                    telegram_id,
+                )
+                return self._row_to_location(row) if row else None
+
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute(
+                """
+                UPDATE locations
+                SET queue = ?, house_id = ?
+                WHERE id = ? AND telegram_id = ?
+                """,
+                (new_queue, updated_house_id, loc_id, telegram_id),
+            )
+            await db.commit()
+            async with db.execute(
+                "SELECT * FROM locations WHERE id = ? AND telegram_id = ?",
+                (loc_id, telegram_id),
+            ) as cursor:
+                row = await cursor.fetchone()
+                return self._row_to_location(row) if row else None
+
     async def delete_location(self, loc_id: int, telegram_id: int) -> bool:
         if self.is_supabase_rest:
             client = self._get_http_client()
@@ -1427,6 +1509,7 @@ class Database:
                 params: dict[str, str] = {
                     "select": "queue",
                     "city_name": f"eq.{c_name}",
+                    "order": "id.desc",
                     "limit": "1",
                 }
                 if s_name:

@@ -68,6 +68,7 @@ class VOEDataClient:
         self._github_cache_data: dict[tuple[str, date], DaySchedule] = {}
         self.address_index = AddressIndex()
         self._voe_live_blocked_until: float = 0.0
+        self._telethon_lock: asyncio.Lock = asyncio.Lock()
 
     def _get_client(self) -> httpx.AsyncClient:
         if self._http_client is None:
@@ -238,24 +239,32 @@ class VOEDataClient:
     ) -> Optional[AddressScheduleResult]:
         """
         Визначає чергу ГПВ та розклад за адресою:
-        1. Перевіряє локальний індекс ГПВ (якщо передані локальні ID або назви адреси).
+        1. Перевіряє актуальний індекс ГПВ та runtime/verified перевизначення (ігноруючи застарілий суфікс у house_id).
         2. Якщо це числові ID сайту VOE і сайт не заблокований Cloudflare — виконує запит до /disconnection/detailed.
         3. Підтягує актуальний розклад для знайденої черги з GitHub JSON mirror.
         """
         resolved_queue: Optional[str] = None
 
-        # 1. Якщо house_id вже містить код черги з локального індексу (формат c_0_s_10_h_24_1.1)
-        m_q = re.search(r"_h_[^_]+_([1-6]\.[12])$", str(house_id))
-        if m_q:
-            resolved_queue = m_q.group(1)
+        # 0. Перевіряємо верифіковані / runtime перевизначення черги для адреси
+        if city_name and street_name and house_num:
+            ov_q = self.address_index.get_address_override(city_name, street_name, house_num)
+            if ov_q in ALL_QUEUES:
+                resolved_queue = ov_q
 
-        # 2. Якщо street_id з локального індексу
-        if not resolved_queue and str(street_id).startswith("c_"):
-            h_matches = self.address_index.search_houses(street_id, house_num or "")
+        # 1. Якщо street_id з локального індексу — шукаємо актуальну чергу будинку в індексі
+        if not resolved_queue and str(street_id).startswith("c_") and house_num:
+            h_matches = self.address_index.search_houses(street_id, house_num)
             if len(h_matches) == 1:
                 resolved_queue = h_matches[0]["queue"]
             elif h_matches and h_matches[0].get("score", 0) >= 3:
                 resolved_queue = h_matches[0]["queue"]
+
+        # 2. Текстовий пошук у локальному індексі ГПВ за (city_name, street_name, house_num)
+        if not resolved_queue and (city_name or street_name):
+            query_str = ", ".join(p for p in (city_name, street_name, house_num) if p)
+            free_matches = self.address_index.parse_and_search_freeform(query_str, limit=3)
+            if len(free_matches) == 1 or (free_matches and free_matches[0].get("score", 0) >= 2):
+                resolved_queue = free_matches[0]["queue"]
 
         # 3. Якщо city_id з локального індексу і це населений пункт без вулиць з однією чергою
         if not resolved_queue and str(city_id).startswith("c_") and not street_id:
@@ -263,55 +272,24 @@ class VOEDataClient:
             if c_obj and len(c_obj.get("queues", [])) == 1:
                 resolved_queue = c_obj["queues"][0]
 
-        # 4. Спроба живого запиту до сайту VOE (для числових ID, якщо немає Cloudflare блокування)
+        # 4. Fallback: якщо house_id вже містить код черги з локального індексу (формат c_0_s_10_h_24_1.1)
+        if not resolved_queue:
+            m_q = re.search(r"_h_[^_]+_([1-6]\.[12])$", str(house_id))
+            if m_q:
+                resolved_queue = m_q.group(1)
+
+        # 5. Спроба живого запиту до сайту VOE (для числових ID, якщо немає Cloudflare блокування)
         if not resolved_queue and time.monotonic() >= self._voe_live_blocked_until and str(city_id).isdigit():
-            form_url = f"{self.base_url}/disconnection/detailed"
-            try:
-                client = self._get_client()
-                get_resp = await client.get(form_url, timeout=6.0)
-                if "disconnection.voe.com.ua" in str(get_resp.url) or "Just a moment..." in get_resp.text:
-                    self._voe_live_blocked_until = time.monotonic() + 600.0
-                else:
-                    get_resp.raise_for_status()
-                    soup = BeautifulSoup(get_resp.text, "html.parser")
-
-                    form_build_id_el = soup.find("input", {"name": "form_build_id"})
-                    form_id_el = soup.find("input", {"name": "form_id"})
-                    form_build_id = form_build_id_el["value"] if form_build_id_el else ""
-                    form_id = (
-                        form_id_el["value"]
-                        if form_id_el
-                        else "disconnection_detailed_search_form"
-                    )
-
-                    payload = {
-                        "search_type": "0",
-                        "city": city_name,
-                        "city_id": city_id,
-                        "street": street_name,
-                        "street_id": street_id,
-                        "house": house_num,
-                        "house_id": house_id,
-                        "form_build_id": form_build_id,
-                        "form_id": form_id,
-                        "search": "Показати",
-                        "op": "Пошук",
-                    }
-                    post_resp = await client.post(form_url, data=payload, timeout=8.0)
-                    post_resp.raise_for_status()
-                    live_res = self.parse_detailed_html(post_resp.text)
-                    if live_res:
-                        return live_res
-            except Exception as exc:
-                self._voe_live_blocked_until = time.monotonic() + 300.0
-                logger.debug("Live VOE address lookup fallback: %s", exc)
-
-        # 5. Текстовий пошук у локальному індексі ГПВ за (city_name, street_name, house_num)
-        if not resolved_queue and (city_name or street_name):
-            query_str = ", ".join(p for p in (city_name, street_name, house_num) if p)
-            free_matches = self.address_index.parse_and_search_freeform(query_str, limit=3)
-            if len(free_matches) == 1 or (free_matches and free_matches[0].get("score", 0) >= 2):
-                resolved_queue = free_matches[0]["queue"]
+            live_res = await self._fetch_live_voe_detailed(
+                city_id=city_id,
+                street_id=street_id,
+                house_id=house_id,
+                city_name=city_name,
+                street_name=street_name,
+                house_num=house_num,
+            )
+            if live_res:
+                return live_res
 
         if not resolved_queue:
             return None
@@ -324,6 +302,134 @@ class VOEDataClient:
                 schedules[s_date] = sched
 
         return AddressScheduleResult(queue=resolved_queue, schedules=schedules)
+
+    async def _fetch_live_voe_detailed(
+        self,
+        city_id: str,
+        street_id: str,
+        house_id: str,
+        city_name: str = "",
+        street_name: str = "",
+        house_num: str = "",
+    ) -> Optional[AddressScheduleResult]:
+        if time.monotonic() < self._voe_live_blocked_until:
+            return None
+        form_url = f"{self.base_url}/disconnection/detailed"
+        try:
+            client = self._get_client()
+            get_resp = await client.get(form_url, timeout=6.0)
+            if "disconnection.voe.com.ua" in str(get_resp.url) or "Just a moment..." in get_resp.text:
+                self._voe_live_blocked_until = time.monotonic() + 600.0
+                return None
+
+            get_resp.raise_for_status()
+            soup = BeautifulSoup(get_resp.text, "html.parser")
+
+            form_build_id_el = soup.find("input", {"name": "form_build_id"})
+            form_id_el = soup.find("input", {"name": "form_id"})
+            form_build_id = form_build_id_el["value"] if form_build_id_el else ""
+            form_id = (
+                form_id_el["value"]
+                if form_id_el
+                else "disconnection_detailed_search_form"
+            )
+
+            payload = {
+                "search_type": "0",
+                "city": city_name,
+                "city_id": city_id,
+                "street": street_name,
+                "street_id": street_id,
+                "house": house_num,
+                "house_id": house_id,
+                "form_build_id": form_build_id,
+                "form_id": form_id,
+                "search": "Показати",
+                "op": "Пошук",
+            }
+            post_resp = await client.post(form_url, data=payload, timeout=8.0)
+            post_resp.raise_for_status()
+            live_res = self.parse_detailed_html(post_resp.text)
+            if live_res and city_name and street_name and house_num:
+                self.address_index.set_address_override(
+                    city_name, street_name, house_num, live_res.queue
+                )
+            return live_res
+        except Exception as exc:
+            self._voe_live_blocked_until = time.monotonic() + 300.0
+            logger.debug("Live VOE address lookup fallback: %s", exc)
+            return None
+
+    async def verify_address_queue(
+        self,
+        city_name: str,
+        street_name: str = "",
+        house_num: str = "",
+        city_id: str = "",
+        street_id: str = "",
+        house_id: str = "",
+        known_schedules: Optional[dict[tuple[str, date], DaySchedule]] = None,
+    ) -> Optional[str]:
+        """
+        Перевіряє актуальну чергу ГПВ для адреси через живі офіційні джерела:
+        1. Офіційний бот @pat_voe_bot через Telethon (якщо TELETHON_ENABLED=true).
+        2. Жива вебформа voe.com.ua/disconnection/detailed (якщо доступні числові ID та немає Cloudflare блоку).
+        3. Актуальний AddressIndex (з урахуванням оновлених PDF та перевизначень, ігноруючи старий house_id).
+        """
+        # 1. Спроба перевірки через @pat_voe_bot (Telethon)
+        if settings.telethon_enabled and city_name and (street_name or house_num):
+            bot_res = await self.check_address_queue_via_telethon(
+                city_name=city_name,
+                street_name=street_name,
+                house_num=house_num,
+                known_schedules=known_schedules,
+            )
+            if bot_res and bot_res.queue in ALL_QUEUES:
+                if street_name and house_num:
+                    self.address_index.set_address_override(
+                        city_name, street_name, house_num, bot_res.queue
+                    )
+                return bot_res.queue
+
+        # 2. Спроба перевірки через живу форму сайту VOE (для числових ID)
+        if str(city_id).isdigit() and time.monotonic() >= self._voe_live_blocked_until:
+            live_res = await self._fetch_live_voe_detailed(
+                city_id=city_id,
+                street_id=street_id,
+                house_id=house_id,
+                city_name=city_name,
+                street_name=street_name,
+                house_num=house_num,
+            )
+            if live_res and live_res.queue in ALL_QUEUES:
+                return live_res.queue
+
+        # 3. Перевірка в актуальному індексі адрес (без довіри старому суфіксу house_id)
+        if city_name and street_name and house_num:
+            ov = self.address_index.get_address_override(city_name, street_name, house_num)
+            if ov in ALL_QUEUES:
+                return ov
+
+        if str(street_id).startswith("c_") and house_num:
+            h_matches = self.address_index.search_houses(street_id, house_num)
+            if len(h_matches) == 1 and h_matches[0]["queue"] in ALL_QUEUES:
+                return h_matches[0]["queue"]
+            if h_matches and h_matches[0].get("score", 0) >= 3 and h_matches[0]["queue"] in ALL_QUEUES:
+                return h_matches[0]["queue"]
+
+        if city_name or street_name:
+            query_str = ", ".join(p for p in (city_name, street_name, house_num) if p)
+            free_matches = self.address_index.parse_and_search_freeform(query_str, limit=3)
+            if len(free_matches) == 1 and free_matches[0]["queue"] in ALL_QUEUES:
+                return free_matches[0]["queue"]
+            if (
+                free_matches
+                and free_matches[0].get("score", 0) >= 3
+                and free_matches[0]["queue"] in ALL_QUEUES
+            ):
+                return free_matches[0]["queue"]
+
+        return None
 
     @classmethod
     def parse_detailed_html(cls, html_text: str) -> Optional[AddressScheduleResult]:
@@ -989,8 +1095,247 @@ class VOEDataClient:
         return slots
 
     # -------------------------------------------------------------------------
-    # 3. Fallback: Офіційний Telegram-бот @pat_voe_bot через Telethon + Image Parser
+    # 3. Офіційний Telegram-бот @pat_voe_bot через Telethon + Image Fingerprint
     # -------------------------------------------------------------------------
+    @staticmethod
+    def extract_queue_from_text(text: str) -> Optional[str]:
+        """Витягує код черги (1.1 .. 6.2) із тексту повідомлення або підпису @pat_voe_bot."""
+        if not text:
+            return None
+        m = re.search(
+            r"(?:черга|черги|черзі|підчерга|підчерги|група|групи)\s*(?:ГПВ\s*)?[:№\-]?\s*([1-6][.,][1-2])\b"
+            r"|\b([1-6][.,][1-2])\s*(?:черга|черги|підчерга|підчерги|група)\b",
+            text,
+            re.IGNORECASE,
+        )
+        if m:
+            raw_q = (m.group(1) or m.group(2)).replace(",", ".")
+            if raw_q in ALL_QUEUES:
+                return raw_q
+        return None
+
+    @classmethod
+    def match_schedule_to_queue(
+        cls,
+        target_sched: DaySchedule,
+        known_schedules: dict[tuple[str, date], DaySchedule],
+    ) -> Optional[str]:
+        """
+        Визначає чергу ГПВ (1.1 .. 6.2) за 48-слотовим відбитком графіка (fingerprint matching).
+        Порівнює розпізнаний графік із відомими графіками всіх 12 підчерг на ту ж дату.
+        """
+        if not known_schedules or target_sched.total_outage_minutes == 0:
+            return None
+
+        t_date = target_sched.schedule_date
+        t_slots = target_sched.slots
+        t_mask = [s.is_outage for s in t_slots]
+
+        exact_matches: list[str] = []
+        mask_matches: list[tuple[int, str]] = []
+
+        for q in ALL_QUEUES:
+            cand = known_schedules.get((q, t_date))
+            if not cand or cand.total_outage_minutes == 0:
+                continue
+            if cand.slots == t_slots:
+                exact_matches.append(q)
+            c_mask = [s.is_outage for s in cand.slots]
+            if c_mask == t_mask:
+                exact_slot_hits = sum(1 for a, b in zip(t_slots, cand.slots) if a == b)
+                mask_matches.append((exact_slot_hits, q))
+
+        if len(exact_matches) == 1:
+            return exact_matches[0]
+        if exact_matches:
+            if target_sched.queue in exact_matches:
+                return target_sched.queue
+            return exact_matches[0]
+
+        if len(mask_matches) == 1:
+            return mask_matches[0][1]
+        if mask_matches:
+            mask_matches.sort(key=lambda x: (-x[0], x[1]))
+            best_hits = mask_matches[0][0]
+            top_queues = [q for hits, q in mask_matches if hits == best_hits]
+            if target_sched.queue in top_queues:
+                return target_sched.queue
+            return top_queues[0]
+
+        return None
+
+    async def check_address_queue_via_telethon(
+        self,
+        city_name: str,
+        street_name: str = "",
+        house_num: str = "",
+        known_schedules: Optional[dict[tuple[str, date], DaySchedule]] = None,
+    ) -> Optional[AddressScheduleResult]:
+        """
+        Перевіряє актуальну чергу ГПВ за адресою через офіційний бот @pat_voe_bot (Telethon):
+        1. Шукає серед останніх повідомлень у діалозі з @pat_voe_bot згадку цієї адреси.
+        2. Якщо не знайдено — виконує інтерактивний запит адреси в @pat_voe_bot,
+           парсить текстову відповідь (Черга X.Y) або розпізнає зображення графіка
+           та зіставляє його 48 слотів із 12 чергами.
+        """
+        if not settings.telethon_enabled:
+            return None
+        if not (
+            settings.telethon_api_id
+            and settings.telethon_api_hash
+            and settings.telethon_session_string
+        ):
+            logger.warning("Telethon enabled but credentials are missing in .env")
+            return None
+
+        if known_schedules is None:
+            known_schedules = await self.fetch_all_queues_from_github()
+
+        today = datetime.now(settings.tz).date()
+        st_bare = re.sub(
+            r"^(?:вул\.?|вулиця|пров\.?|провулок|просп\.?|проспект|пл\.?|площа|тупик|проїзд)\s*",
+            "",
+            (street_name or "").strip(),
+            flags=re.IGNORECASE,
+        ).strip()
+        c_bare = re.sub(
+            r"^(?:м\.|смт\.?|селище|с-ще\.?|с\.|х\.)\s*",
+            "",
+            (city_name or "").strip(),
+            flags=re.IGNORECASE,
+        ).strip()
+        h_clean = (house_num or "").strip().lower()
+
+        def _msg_matches_address(txt: str) -> bool:
+            t_low = txt.lower()
+            if st_bare and st_bare.lower() not in t_low:
+                return False
+            if h_clean and not re.search(rf"(?:^|[\s,№.буд/-]){re.escape(h_clean)}(?:$|[\s,.)/])", t_low):
+                return False
+            return bool(st_bare or c_bare)
+
+        async def _extract_result_from_msg(
+            client: Any, msg: Any
+        ) -> Optional[AddressScheduleResult]:
+            txt = (getattr(msg, "message", "") or "").strip()
+            q_from_text = self.extract_queue_from_text(txt)
+            schedules: dict[date, DaySchedule] = {}
+            target_d = today
+            dm = re.search(r"(\d{2})\.(\d{2})\.(\d{4})", txt)
+            if dm:
+                try:
+                    target_d = date(int(dm.group(3)), int(dm.group(2)), int(dm.group(1)))
+                except ValueError:
+                    target_d = today
+
+            if getattr(msg, "photo", None):
+                img_bytes = await client.download_media(msg.photo, file=bytes)
+                if img_bytes:
+                    try:
+                        parsed = parse_voe_schedule_image(
+                            img_bytes,
+                            queue=q_from_text or "1.1",
+                            schedule_date=target_d,
+                        )
+                        if not q_from_text and known_schedules:
+                            matched_q = self.match_schedule_to_queue(parsed, known_schedules)
+                            if matched_q:
+                                q_from_text = matched_q
+                                parsed.queue = matched_q
+                        if q_from_text:
+                            parsed.queue = q_from_text
+                            schedules[target_d] = parsed
+                    except Exception as exc:
+                        logger.debug("Telethon photo parse skipped: %s", exc)
+
+            if q_from_text in ALL_QUEUES:
+                if not schedules and known_schedules:
+                    for (q_code, s_date), sched in known_schedules.items():
+                        if q_code == q_from_text:
+                            schedules[s_date] = sched
+                return AddressScheduleResult(queue=q_from_text, schedules=schedules)
+            return None
+
+        async with self._telethon_lock:
+            try:
+                from telethon import TelegramClient
+                from telethon.sessions import StringSession
+
+                async with TelegramClient(
+                    StringSession(settings.telethon_session_string),
+                    settings.telethon_api_id,
+                    settings.telethon_api_hash,
+                ) as client:
+                    bot_entity = await client.get_entity(settings.official_voe_bot_username)
+
+                    # 1. Перевіряємо останні повідомлення у чаті з @pat_voe_bot
+                    recent_msgs = await client.get_messages(bot_entity, limit=25)
+                    for msg in recent_msgs:
+                        txt = (getattr(msg, "message", "") or "").strip()
+                        if txt and _msg_matches_address(txt):
+                            res = await _extract_result_from_msg(client, msg)
+                            if res:
+                                return res
+
+                    # 2. Інтерактивний запит адреси в діалозі з @pat_voe_bot
+                    query_parts = [p for p in (c_bare or city_name, st_bare or street_name, house_num) if p]
+                    if not query_parts:
+                        return None
+
+                    async with client.conversation(bot_entity, timeout=12.0) as conv:
+                        await conv.send_message("/start")
+                        resp = await conv.get_response()
+
+                        # Якщо у відповіді є кнопки для перевірки відключень / графіка за адресою — натискаємо
+                        for _ in range(2):
+                            clicked = False
+                            if getattr(resp, "buttons", None):
+                                for row in resp.buttons:
+                                    for btn in row:
+                                        b_txt = (getattr(btn, "text", "") or "").lower()
+                                        if any(
+                                            kw in b_txt
+                                            for kw in ("графік", "відключен", "адрес", "перевір", "гпв", "черга")
+                                        ):
+                                            await btn.click()
+                                            resp = await conv.get_response()
+                                            clicked = True
+                                            break
+                                    if clicked:
+                                        break
+                            if not clicked:
+                                break
+
+                        # Послідовно надсилаємо кроки адреси (місто -> вулиця -> будинок) або повний рядок
+                        steps = [s for s in (c_bare, st_bare, house_num) if s]
+                        for step_val in steps:
+                            await conv.send_message(step_val)
+                            resp = await conv.get_response()
+                            res = await _extract_result_from_msg(client, resp)
+                            if res:
+                                return res
+                            # Якщо бот запропонував інлайн-вибір із варіантів (наприклад, список міст/вулиць/будинків)
+                            if getattr(resp, "buttons", None):
+                                for row in resp.buttons:
+                                    for btn in row:
+                                        b_txt = (getattr(btn, "text", "") or "").lower()
+                                        if step_val.lower() in b_txt:
+                                            await btn.click()
+                                            resp = await conv.get_response()
+                                            res = await _extract_result_from_msg(client, resp)
+                                            if res:
+                                                return res
+                                            break
+            except Exception as exc:
+                logger.warning(
+                    "Telethon address check error for %s, %s, %s: %s",
+                    city_name,
+                    street_name,
+                    house_num,
+                    exc,
+                )
+        return None
+
     async def fetch_from_official_bot(
         self, queue: str, target_date: date
     ) -> Optional[DaySchedule]:
@@ -1008,34 +1353,35 @@ class VOEDataClient:
             logger.warning("Telethon enabled but credentials are missing in .env")
             return None
 
-        try:
-            from telethon import TelegramClient
-            from telethon.sessions import StringSession
+        async with self._telethon_lock:
+            try:
+                from telethon import TelegramClient
+                from telethon.sessions import StringSession
 
-            async with TelegramClient(
-                StringSession(settings.telethon_session_string),
-                settings.telethon_api_id,
-                settings.telethon_api_hash,
-            ) as client:
-                bot_entity = await client.get_entity(settings.official_voe_bot_username)
-                # Шукаємо останні повідомлення з фото в діалозі з ботом або запитуємо графік
-                messages = await client.get_messages(bot_entity, limit=15)
-                date_str = target_date.strftime("%d.%m.%Y")
-                q_norm = queue.strip()
-                for msg in messages:
-                    if msg.photo:
-                        caption = (getattr(msg, "message", "") or "").strip()
-                        if caption:
-                            if q_norm not in caption and f"{q_norm} черга" not in caption:
-                                continue
-                            if date_str not in caption:
-                                continue
-                        img_bytes = await client.download_media(msg.photo, file=bytes)
-                        if img_bytes:
-                            parsed = parse_voe_schedule_image(
-                                img_bytes, queue=queue, schedule_date=target_date
-                            )
-                            return parsed
-        except Exception as exc:
-            logger.warning("Telethon fallback error for queue %s: %s", queue, exc)
+                async with TelegramClient(
+                    StringSession(settings.telethon_session_string),
+                    settings.telethon_api_id,
+                    settings.telethon_api_hash,
+                ) as client:
+                    bot_entity = await client.get_entity(settings.official_voe_bot_username)
+                    # Шукаємо останні повідомлення з фото в діалозі з ботом або запитуємо графік
+                    messages = await client.get_messages(bot_entity, limit=15)
+                    date_str = target_date.strftime("%d.%m.%Y")
+                    q_norm = queue.strip()
+                    for msg in messages:
+                        if msg.photo:
+                            caption = (getattr(msg, "message", "") or "").strip()
+                            if caption:
+                                if q_norm not in caption and f"{q_norm} черга" not in caption:
+                                    continue
+                                if date_str not in caption:
+                                    continue
+                            img_bytes = await client.download_media(msg.photo, file=bytes)
+                            if img_bytes:
+                                parsed = parse_voe_schedule_image(
+                                    img_bytes, queue=queue, schedule_date=target_date
+                                )
+                                return parsed
+            except Exception as exc:
+                logger.warning("Telethon fallback error for queue %s: %s", queue, exc)
         return None
