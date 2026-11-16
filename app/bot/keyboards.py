@@ -232,3 +232,36 @@ def settings_kb(user: UserProfile) -> InlineKeyboardMarkup:
             ],
         ]
     )
+
+
+def broadcast_cancel_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Скасувати", callback_data="broadcast:cancel")]
+        ]
+    )
+
+
+def broadcast_confirm_kb(user_count: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=f"✅ Надіслати ({user_count} корист.)",
+                    callback_data="broadcast:send",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="✏️ Змінити повідомлення",
+                    callback_data="broadcast:edit",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="❌ Скасувати",
+                    callback_data="broadcast:cancel",
+                )
+            ],
+        ]
+    )

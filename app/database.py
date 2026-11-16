@@ -836,6 +836,48 @@ class Database:
                 rows = await cursor.fetchall()
                 return [r[0] for r in rows]
 
+    async def get_all_user_ids(self) -> list[int]:
+        """Повертає список Telegram ID усіх зареєстрованих користувачів."""
+        if self.is_supabase_rest:
+            client = self._get_http_client()
+            user_ids: list[int] = []
+            offset = 0
+            page_size = 1000
+            while True:
+                resp = await client.get(
+                    "/users",
+                    params={
+                        "select": "telegram_id",
+                        "order": "telegram_id.asc",
+                        "limit": str(page_size),
+                        "offset": str(offset),
+                    },
+                )
+                resp.raise_for_status()
+                rows = resp.json()
+                if not rows:
+                    break
+                user_ids.extend(int(r["telegram_id"]) for r in rows)
+                if len(rows) < page_size:
+                    break
+                offset += page_size
+            return user_ids
+
+        if self.is_postgres:
+            pool = await self._get_pg_pool()
+            async with pool.acquire() as conn:
+                rows = await conn.fetch(
+                    "SELECT telegram_id FROM users ORDER BY telegram_id ASC"
+                )
+                return [int(r["telegram_id"]) for r in rows]
+
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                "SELECT telegram_id FROM users ORDER BY telegram_id ASC"
+            ) as cursor:
+                rows = await cursor.fetchall()
+                return [int(r[0]) for r in rows]
+
     @staticmethod
     def _row_to_location(row: Mapping[str, Any]) -> UserLocation:
         return UserLocation(

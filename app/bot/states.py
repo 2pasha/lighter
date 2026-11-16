@@ -19,3 +19,10 @@ class QuietHoursStates(StatesGroup):
     """Введення кастомного діапазону тихих годин (наприклад 23:00-07:00)."""
 
     entering_range = State()
+
+
+class BroadcastStates(StatesGroup):
+    """Покрокова розсилка повідомлень адміністратором."""
+
+    entering_message = State()
+    confirming = State()

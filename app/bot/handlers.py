@@ -9,6 +9,12 @@ from datetime import date, datetime, timedelta
 from typing import Optional
 
 from aiogram import Bot, F, Router
+from aiogram.exceptions import (
+    TelegramAPIError,
+    TelegramBadRequest,
+    TelegramForbiddenError,
+    TelegramRetryAfter,
+)
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.types import BufferedInputFile, CallbackQuery, Message
@@ -20,6 +26,8 @@ from app.bot.keyboards import (
     BTN_TOMORROW,
     add_location_method_kb,
     autocomplete_items_kb,
+    broadcast_cancel_kb,
+    broadcast_confirm_kb,
     label_presets_kb,
     locations_list_kb,
     main_reply_keyboard,
@@ -29,7 +37,7 @@ from app.bot.keyboards import (
     settings_kb,
 )
 from app.bot.middlewares import AntiSpamMiddleware
-from app.bot.states import AddLocationStates, QuietHoursStates
+from app.bot.states import AddLocationStates, BroadcastStates, QuietHoursStates
 from app.config import ALL_QUEUES, settings
 from app.database import Database, UserLocation
 from app.models import DaySchedule
@@ -1171,6 +1179,144 @@ def setup_routers(
             )
 
     # -------------------------------------------------------------------------
+    # Адмін-розсилка (/broadcast)
+    # -------------------------------------------------------------------------
+    @router.message(Command("broadcast"))
+    async def cmd_broadcast(message: Message, state: FSMContext) -> None:
+        if not message.from_user:
+            return
+        if not is_admin(message.from_user.id):
+            await message.answer("⛔ Доступ заборонено. Ця команда доступна лише адміністратору.")
+            return
+
+        await state.clear()
+        user_ids = await db.get_all_user_ids()
+        if not user_ids:
+            await message.answer("ℹ️ У базі даних ще немає жодного користувача для розсилки.")
+            return
+
+        await state.set_state(BroadcastStates.entering_message)
+        await message.answer(
+            f"📢 <b>Нова розсилка</b>\n\n"
+            f"Знайдено користувачів: <b>{len(user_ids)}</b>.\n"
+            "Надішліть повідомлення, яке ви хочете розіслати (текст, фото з підписом тощо):",
+            parse_mode="HTML",
+            reply_markup=broadcast_cancel_kb(),
+        )
+
+    @router.message(BroadcastStates.entering_message)
+    async def handle_broadcast_message(
+        message: Message, state: FSMContext, bot: Bot
+    ) -> None:
+        if not message.from_user or not is_admin(message.from_user.id):
+            await state.clear()
+            return
+
+        await state.update_data(
+            source_chat_id=message.chat.id,
+            source_message_id=message.message_id,
+        )
+        await state.set_state(BroadcastStates.confirming)
+
+        user_ids = await db.get_all_user_ids()
+        await message.answer("👀 <b>Попередній перегляд повідомлення:</b>", parse_mode="HTML")
+        await bot.copy_message(
+            chat_id=message.chat.id,
+            from_chat_id=message.chat.id,
+            message_id=message.message_id,
+        )
+        await message.answer(
+            f"Підтвердіть відправку для <b>{len(user_ids)}</b> користувачів:",
+            parse_mode="HTML",
+            reply_markup=broadcast_confirm_kb(len(user_ids)),
+        )
+
+    @router.callback_query(F.data == "broadcast:edit")
+    async def cb_broadcast_edit(callback: CallbackQuery, state: FSMContext) -> None:
+        if not callback.from_user or not is_admin(callback.from_user.id):
+            await callback.answer("⛔ Доступ заборонено.", show_alert=True)
+            return
+
+        await state.set_state(BroadcastStates.entering_message)
+        if callback.message:
+            await callback.message.edit_text(
+                "✏️ Надішліть нове повідомлення для розсилки:",
+                reply_markup=broadcast_cancel_kb(),
+            )
+        await callback.answer()
+
+    @router.callback_query(F.data == "broadcast:cancel")
+    async def cb_broadcast_cancel(callback: CallbackQuery, state: FSMContext) -> None:
+        if not callback.from_user or not is_admin(callback.from_user.id):
+            await callback.answer("⛔ Доступ заборонено.", show_alert=True)
+            return
+
+        await state.clear()
+        if callback.message:
+            await callback.message.edit_text("❌ Розсилку скасовано.")
+        await callback.answer()
+
+    @router.callback_query(F.data == "broadcast:send")
+    async def cb_broadcast_send(
+        callback: CallbackQuery, state: FSMContext, bot: Bot
+    ) -> None:
+        if not callback.from_user or not is_admin(callback.from_user.id):
+            await callback.answer("⛔ Доступ заборонено.", show_alert=True)
+            return
+
+        data = await state.get_data()
+        source_chat_id = data.get("source_chat_id")
+        source_message_id = data.get("source_message_id")
+        await state.clear()
+
+        if source_chat_id is None or source_message_id is None:
+            if callback.message:
+                await callback.message.edit_text(
+                    "⚠️ Дані повідомлення втрачено. Запустіть /broadcast знову."
+                )
+            await callback.answer()
+            return
+
+        user_ids = await db.get_all_user_ids()
+        total = len(user_ids)
+        status_msg = callback.message
+        if status_msg:
+            await status_msg.edit_text(
+                f"⏳ <b>Розсилка розпочата...</b>\nНадіслано: 0 / {total}",
+                parse_mode="HTML",
+            )
+        await callback.answer("Розсилка запущена!")
+
+        async def _on_progress(processed: int, total_count: int) -> None:
+            if status_msg and processed % 25 == 0 and processed < total_count:
+                try:
+                    await status_msg.edit_text(
+                        f"⏳ <b>Розсилка триває...</b>\nОброблено: {processed} / {total_count}",
+                        parse_mode="HTML",
+                    )
+                except TelegramBadRequest:
+                    pass
+
+        stats = await execute_broadcast(
+            bot=bot,
+            user_ids=user_ids,
+            from_chat_id=int(source_chat_id),
+            message_id=int(source_message_id),
+            progress_cb=_on_progress,
+        )
+
+        stats_text = (
+            "📊 <b>Статистика розсилки</b>\n\n"
+            f"• Всього користувачів: <b>{stats['total']}</b>\n"
+            f"• ✅ Успішно доставлено: <b>{stats['sent']}</b>\n"
+            f"• 🚫 Заблокували бота: <b>{stats['blocked']}</b>\n"
+            f"• ⚠️ Інші помилки: <b>{stats['failed']}</b>\n"
+            f"• ⏱ Час виконання: <b>{stats['duration_sec']} сек</b>"
+        )
+        if status_msg:
+            await status_msg.edit_text(stats_text, parse_mode="HTML")
+
+    # -------------------------------------------------------------------------
     # Розпізнавання надісланого користувачем зображення з @pat_voe_bot
     # -------------------------------------------------------------------------
     @router.message(F.photo)
@@ -1252,3 +1398,66 @@ def _format_settings_text(user) -> str:
         "• <b>Можливі (жовті 🟡) слоти</b> — враховувати заплановані (жовті) слоти нарівні з підтвердженими (синіми/червоними 🔴).\n"
         "• <b>Тихі години</b> — не турбувати 15-хвилинними сповіщеннями вночі."
     )
+
+
+def is_admin(user_id: int) -> bool:
+    """Перевіряє, чи є користувач адміністратором бота."""
+    return user_id in settings.admin_ids
+
+
+async def execute_broadcast(
+    bot: Bot,
+    user_ids: list[int],
+    from_chat_id: int,
+    message_id: int,
+    progress_cb=None,
+    delay_seconds: float = 0.05,
+) -> dict[str, int | float]:
+    """Розсилає скопійоване повідомлення всім користувачам та повертає статистику."""
+    started = time.monotonic()
+    total = len(user_ids)
+    sent = 0
+    blocked = 0
+    failed = 0
+
+    for idx, uid in enumerate(user_ids, start=1):
+        try:
+            await bot.copy_message(
+                chat_id=uid,
+                from_chat_id=from_chat_id,
+                message_id=message_id,
+            )
+            sent += 1
+        except TelegramRetryAfter as exc:
+            await asyncio.sleep(float(exc.retry_after) + 0.1)
+            try:
+                await bot.copy_message(
+                    chat_id=uid,
+                    from_chat_id=from_chat_id,
+                    message_id=message_id,
+                )
+                sent += 1
+            except TelegramForbiddenError:
+                blocked += 1
+            except (TelegramAPIError, Exception) as retry_exc:
+                logger.warning("Broadcast retry failed for %s: %s", uid, retry_exc)
+                failed += 1
+        except TelegramForbiddenError:
+            blocked += 1
+        except (TelegramAPIError, Exception) as exc:
+            logger.warning("Broadcast failed for %s: %s", uid, exc)
+            failed += 1
+
+        if progress_cb is not None:
+            await progress_cb(idx, total)
+
+        if delay_seconds > 0 and idx < total:
+            await asyncio.sleep(delay_seconds)
+
+    return {
+        "total": total,
+        "sent": sent,
+        "blocked": blocked,
+        "failed": failed,
+        "duration_sec": round(time.monotonic() - started, 2),
+    }

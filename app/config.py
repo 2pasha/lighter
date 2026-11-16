@@ -65,6 +65,13 @@ class Settings:
             os.getenv("WIDGET_SECRET") or self.bot_token or "svitlo_widget_default_secret"
         ).strip()
 
+        raw_admin_ids = os.getenv("ADMIN_IDS", "").strip()
+        self.admin_ids: set[int] = {
+            int(part.strip())
+            for part in raw_admin_ids.split(",")
+            if part.strip().lstrip("-").isdigit()
+        }
+
     @property
     def tz(self) -> ZoneInfo:
         return ZoneInfo(self.timezone_name)
