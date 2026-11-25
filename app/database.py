@@ -5,7 +5,13 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any, Mapping, Optional
 
-from app.config import settings
+from app.config import (
+    REGION_IF,
+    get_region_label,
+    make_queue_key,
+    settings,
+    split_queue_key,
+)
 from app.models import DaySchedule
 
 logger = logging.getLogger(__name__)
@@ -66,9 +72,29 @@ class UserLocation:
     is_active: bool = True
 
     @property
+    def region(self) -> str:
+        reg, _ = split_queue_key(self.queue)
+        if reg == REGION_IF or (self.city_id and str(self.city_id).startswith("if")):
+            return REGION_IF
+        return reg
+
+    @property
+    def queue_code(self) -> str:
+        _, code = split_queue_key(self.queue)
+        return code
+
+    @property
+    def region_label(self) -> str:
+        return get_region_label(self.region, short=False)
+
+    @property
+    def region_short_label(self) -> str:
+        return get_region_label(self.region, short=True)
+
+    @property
     def display_address(self) -> str:
         parts = [p for p in (self.city_name, self.street_name, self.house_num) if p]
-        return ", ".join(parts) if parts else f"Черга {self.queue}"
+        return ", ".join(parts) if parts else f"Черга {self.queue_code}"
 
 
 class Database:
@@ -700,14 +726,21 @@ class Database:
         if not existing:
             return None
 
+        # Зберігаємо регіон локації, якщо передано чистий номер черги (напр. '4.2' -> 'if:4.2')
+        if ":" in new_queue:
+            resolved_queue = new_queue
+        else:
+            resolved_queue = make_queue_key(existing.region, new_queue)
+        _, clean_new_code = split_queue_key(resolved_queue)
+
         updated_house_id = new_house_id if new_house_id is not None else existing.house_id
         if (
             new_house_id is None
             and existing.house_id
-            and existing.house_id.endswith(f"_{existing.queue}")
+            and existing.house_id.endswith(f"_{existing.queue_code}")
         ):
-            prefix = existing.house_id[: -len(existing.queue)]
-            updated_house_id = f"{prefix}{new_queue}"
+            prefix = existing.house_id[: -len(existing.queue_code)]
+            updated_house_id = f"{prefix}{clean_new_code}"
 
         if existing.city_name:
             try:
@@ -715,7 +748,7 @@ class Database:
                     city_name=existing.city_name,
                     street_name=existing.street_name,
                     house_num=existing.house_num,
-                    queue=new_queue,
+                    queue=resolved_queue,
                     city_id=existing.city_id,
                     street_id=existing.street_id,
                     house_id=updated_house_id,
@@ -728,7 +761,7 @@ class Database:
             resp = await client.patch(
                 "/locations",
                 params={"id": f"eq.{loc_id}", "telegram_id": f"eq.{telegram_id}"},
-                json={"queue": new_queue, "house_id": updated_house_id},
+                json={"queue": resolved_queue, "house_id": updated_house_id},
                 headers={"Prefer": "return=representation"},
             )
             resp.raise_for_status()
@@ -745,7 +778,7 @@ class Database:
                     WHERE id = $3 AND telegram_id = $4
                     RETURNING *
                     """,
-                    new_queue,
+                    resolved_queue,
                     updated_house_id,
                     loc_id,
                     telegram_id,
@@ -760,7 +793,7 @@ class Database:
                 SET queue = ?, house_id = ?
                 WHERE id = ? AND telegram_id = ?
                 """,
-                (new_queue, updated_house_id, loc_id, telegram_id),
+                (resolved_queue, updated_house_id, loc_id, telegram_id),
             )
             await db.commit()
             async with db.execute(
@@ -769,6 +802,109 @@ class Database:
             ) as cursor:
                 row = await cursor.fetchone()
                 return self._row_to_location(row) if row else None
+
+    async def set_location_active(
+        self, loc_id: int, telegram_id: int, is_active: bool
+    ) -> Optional[UserLocation]:
+        """Вмикає або ставить на паузу окрему локацію користувача."""
+        active_int = 1 if is_active else 0
+
+        if self.is_supabase_rest:
+            client = self._get_http_client()
+            resp = await client.patch(
+                "/locations",
+                params={"id": f"eq.{loc_id}", "telegram_id": f"eq.{telegram_id}"},
+                json={"is_active": active_int},
+                headers={"Prefer": "return=representation"},
+            )
+            resp.raise_for_status()
+            rows = resp.json()
+            return self._row_to_location(rows[0]) if rows else None
+
+        if self.is_postgres:
+            pool = await self._get_pg_pool()
+            async with pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    """
+                    UPDATE locations
+                    SET is_active = $1
+                    WHERE id = $2 AND telegram_id = $3
+                    RETURNING *
+                    """,
+                    active_int,
+                    loc_id,
+                    telegram_id,
+                )
+                return self._row_to_location(row) if row else None
+
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute(
+                "UPDATE locations SET is_active = ? WHERE id = ? AND telegram_id = ?",
+                (active_int, loc_id, telegram_id),
+            )
+            await db.commit()
+            async with db.execute(
+                "SELECT * FROM locations WHERE id = ? AND telegram_id = ?",
+                (loc_id, telegram_id),
+            ) as cursor:
+                row = await cursor.fetchone()
+                return self._row_to_location(row) if row else None
+
+    async def set_only_location_active(
+        self, loc_id: int, telegram_id: int
+    ) -> Optional[UserLocation]:
+        """
+        Робить вказану локацію єдиною активною для користувача,
+        ставлячи всі інші його збережені локації на паузу (is_active = 0).
+        """
+        target = await self.get_location_by_id(loc_id, telegram_id)
+        if not target:
+            return None
+
+        if self.is_supabase_rest:
+            client = self._get_http_client()
+            resp_off = await client.patch(
+                "/locations",
+                params={"telegram_id": f"eq.{telegram_id}", "id": f"neq.{loc_id}"},
+                json={"is_active": 0},
+            )
+            resp_off.raise_for_status()
+            resp_on = await client.patch(
+                "/locations",
+                params={"telegram_id": f"eq.{telegram_id}", "id": f"eq.{loc_id}"},
+                json={"is_active": 1},
+                headers={"Prefer": "return=representation"},
+            )
+            resp_on.raise_for_status()
+            rows = resp_on.json()
+            return self._row_to_location(rows[0]) if rows else target
+
+        if self.is_postgres:
+            pool = await self._get_pg_pool()
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    UPDATE locations
+                    SET is_active = CASE WHEN id = $1 THEN 1 ELSE 0 END
+                    WHERE telegram_id = $2
+                    """,
+                    loc_id,
+                    telegram_id,
+                )
+            return await self.get_location_by_id(loc_id, telegram_id)
+
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                """
+                UPDATE locations
+                SET is_active = CASE WHEN id = ? THEN 1 ELSE 0 END
+                WHERE telegram_id = ?
+                """,
+                (loc_id, telegram_id),
+            )
+            await db.commit()
+        return await self.get_location_by_id(loc_id, telegram_id)
 
     async def delete_location(self, loc_id: int, telegram_id: int) -> bool:
         if self.is_supabase_rest:
@@ -1437,6 +1573,10 @@ class Database:
         if not c_name or not queue:
             return
 
+        reg, _ = split_queue_key(queue)
+        if reg == REGION_IF and not c_name.lower().startswith("if:"):
+            c_name = f"if:{c_name}"
+
         if self.is_supabase_rest:
             # У режимі Supabase REST покладаємося на існуючу таблицю locations
             # та локальний AddressIndex без вимоги міграції нової таблиці в PostgREST.
@@ -1495,6 +1635,7 @@ class Database:
         city_name: str,
         street_name: Optional[str] = None,
         house_num: Optional[str] = None,
+        region: Optional[str] = None,
     ) -> Optional[str]:
         """Шукає збережену чергу для адреси в address_cache або серед існуючих локацій."""
         c_name = (city_name or "").strip()
@@ -1503,6 +1644,12 @@ class Database:
         if not c_name:
             return None
 
+        c_lookup = (
+            f"if:{c_name}"
+            if region == REGION_IF and not c_name.lower().startswith("if:")
+            else c_name
+        )
+
         if self.is_supabase_rest:
             try:
                 client = self._get_http_client()
@@ -1510,7 +1657,7 @@ class Database:
                     "select": "queue",
                     "city_name": f"eq.{c_name}",
                     "order": "id.desc",
-                    "limit": "1",
+                    "limit": "10",
                 }
                 if s_name:
                     params["street_name"] = f"eq.{s_name}"
@@ -1519,8 +1666,13 @@ class Database:
                 resp = await client.get("/locations", params=params)
                 if resp.status_code == 200:
                     rows = resp.json()
-                    if rows and rows[0].get("queue"):
-                        return str(rows[0]["queue"])
+                    for r in rows:
+                        q_val = str(r.get("queue") or "")
+                        if not q_val:
+                            continue
+                        if region and split_queue_key(q_val)[0] != region:
+                            continue
+                        return q_val
             except Exception:
                 pass
             return None
@@ -1536,12 +1688,14 @@ class Database:
                       AND LOWER(house_num) = LOWER($3)
                     LIMIT 1
                     """,
-                    c_name,
+                    c_lookup,
                     s_name,
                     h_num,
                 )
                 if row and row["queue"]:
-                    return str(row["queue"])
+                    q_val = str(row["queue"])
+                    if not region or split_queue_key(q_val)[0] == region:
+                        return q_val
             return None
 
         async with aiosqlite.connect(self.db_path) as db:
@@ -1553,9 +1707,11 @@ class Database:
                   AND LOWER(house_num) = LOWER(?)
                 LIMIT 1
                 """,
-                (c_name, s_name, h_num),
+                (c_lookup, s_name, h_num),
             ) as cursor:
                 row = await cursor.fetchone()
                 if row and row[0]:
-                    return str(row[0])
+                    q_val = str(row[0])
+                    if not region or split_queue_key(q_val)[0] == region:
+                        return q_val
         return None

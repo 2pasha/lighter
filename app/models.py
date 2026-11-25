@@ -121,6 +121,21 @@ class DaySchedule:
         return cls(queue=queue, schedule_date=schedule_date, slots=slots, source=source)
 
     @property
+    def region(self) -> str:
+        from app.config import split_queue_key
+
+        reg, _ = split_queue_key(self.queue)
+        return reg
+
+    @property
+    def queue_code(self) -> str:
+        """Чистий номер підчерги для відображення користувачу (напр. '4.1' замість 'if:4.1')."""
+        from app.config import split_queue_key
+
+        _, code = split_queue_key(self.queue)
+        return code
+
+    @property
     def content_hash(self) -> str:
         """SHA-256 хеш станів слотів для миттєвого виявлення змін у графіку."""
         raw = ",".join(s.value for s in self.slots)

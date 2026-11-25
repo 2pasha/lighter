@@ -20,9 +20,10 @@ try:
 except ImportError:
     BeautifulSoup = Any  # type: ignore
 
-from app.config import ALL_QUEUES, settings
+from app.config import ALL_QUEUES, REGION_IF, REGION_VOE, settings
 from app.models import DaySchedule, SlotState
 from app.services.address_index import AddressIndex, download_and_build_voe_index
+from app.services.if_client import IFDataClient
 from app.services.image_parser import (
     extract_header_queue_and_date,
     parse_voe_schedule_image,
@@ -70,6 +71,7 @@ class VOEDataClient:
         self._github_cache_ts: float = 0.0
         self._github_cache_data: dict[tuple[str, date], DaySchedule] = {}
         self.address_index = AddressIndex()
+        self.if_client = IFDataClient()
         self._voe_live_blocked_until: float = 0.0
         self._telethon_lock: asyncio.Lock = asyncio.Lock()
 
@@ -86,6 +88,31 @@ class VOEDataClient:
         if self._http_client is not None:
             await self._http_client.aclose()
             self._http_client = None
+        await self.if_client.close()
+
+    async def fetch_all_queues_for_region(
+        self, region: str = REGION_VOE, ttl_seconds: float = 30.0
+    ) -> dict[tuple[str, date], DaySchedule]:
+        """Повертає актуальні графіки всіх 12 підчерг для вказаного регіону ('voe' або 'if')."""
+        if region == REGION_IF:
+            return await self.if_client.fetch_all_queues(ttl_seconds=ttl_seconds)
+        return await self.fetch_all_queues_from_github(ttl_seconds=ttl_seconds)
+
+    async def fetch_all_regions_schedules(
+        self, ttl_seconds: float = 30.0
+    ) -> dict[tuple[str, date], DaySchedule]:
+        """Паралельно завантажує актуальні графіки для всіх підтримуваних регіонів."""
+        voe_res, if_res = await asyncio.gather(
+            self.fetch_all_queues_from_github(ttl_seconds=ttl_seconds),
+            self.if_client.fetch_all_queues(ttl_seconds=ttl_seconds),
+            return_exceptions=True,
+        )
+        merged: dict[tuple[str, date], DaySchedule] = {}
+        if isinstance(voe_res, dict):
+            merged.update(voe_res)
+        if isinstance(if_res, dict):
+            merged.update(if_res)
+        return merged
 
     async def refresh_address_index_from_pdf(self) -> int:
         """Оновлює локальний довідник адрес із офіційного PDF ГПВ на сайті voe.com.ua."""

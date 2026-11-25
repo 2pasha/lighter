@@ -7,7 +7,7 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
 )
 
-from app.config import ALL_QUEUES
+from app.config import ALL_QUEUES, REGION_IF, REGION_VOE, split_queue_key
 from app.database import UserLocation, UserProfile
 from app.services.voe_client import AutocompleteItem
 
@@ -28,30 +28,60 @@ def main_reply_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
-def add_location_method_kb() -> InlineKeyboardMarkup:
+def choose_region_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="🔢 Я знаю свою чергу (1.1 – 6.2)",
-                    callback_data="addloc:method:queue",
+                    text="🏔 Івано-Франківська область",
+                    callback_data=f"addloc:reg:{REGION_IF}",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="🏠 Знайти за адресою (Місто, Вулиця, Будинок)",
-                    callback_data="addloc:method:address",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="📸 Надіслати картинку з @pat_voe_bot",
-                    callback_data="addloc:method:image",
+                    text="🌾 Вінницька область",
+                    callback_data=f"addloc:reg:{REGION_VOE}",
                 )
             ],
             [InlineKeyboardButton(text="❌ Скасувати", callback_data="addloc:cancel")],
         ]
     )
+
+
+def add_location_method_kb(region: str = REGION_VOE) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton(
+                text="🔢 Я знаю свою чергу (1.1 – 6.2)",
+                callback_data="addloc:method:queue",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="🏠 Знайти за адресою (Місто, Вулиця, Будинок)",
+                callback_data="addloc:method:address",
+            )
+        ],
+    ]
+    if region == REGION_VOE:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="📸 Розпізнати за картинкою графіка",
+                    callback_data="addloc:method:image",
+                )
+            ]
+        )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="⬅️ Змінити область",
+                callback_data="addloc:back_reg",
+            ),
+            InlineKeyboardButton(text="❌ Скасувати", callback_data="addloc:cancel"),
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def queue_picker_kb(
@@ -134,15 +164,35 @@ def autocomplete_items_kb(
 
 def locations_list_kb(locations: list[UserLocation]) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
+    active_count = sum(1 for l in locations if l.is_active)
+    total_count = len(locations)
+
     for loc in locations:
+        status_icon = "🟢" if loc.is_active else "⏸"
         rows.append(
             [
                 InlineKeyboardButton(
-                    text=f"📍 {loc.label} (Черга {loc.queue})",
+                    text=f"{status_icon} {loc.label} ({loc.region_short_label} · Черга {loc.queue_code})",
                     callback_data=f"loc:view:{loc.id}",
                 ),
             ]
         )
+
+        status_row: list[InlineKeyboardButton] = [
+            InlineKeyboardButton(
+                text="🔕 На паузу" if loc.is_active else "🔔 Увімкнути",
+                callback_data=f"loc:toggle:{loc.id}",
+            )
+        ]
+        if total_count > 1 and not (loc.is_active and active_count == 1):
+            status_row.append(
+                InlineKeyboardButton(
+                    text="🎯 Тільки ця",
+                    callback_data=f"loc:only:{loc.id}",
+                )
+            )
+        rows.append(status_row)
+
         rows.append(
             [
                 InlineKeyboardButton(
@@ -165,9 +215,46 @@ def locations_list_kb(locations: list[UserLocation]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def make_only_active_kb(loc_id: int, label: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=f"🎯 Тільки «{label}» (призупинити інші)",
+                    callback_data=f"loc:only_new:{loc_id}",
+                )
+            ]
+        ]
+    )
+
+
+def resume_paused_locations_kb(
+    locations: list[UserLocation], day_tag: str = "today"
+) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for loc in locations:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"🔔 Увімкнути «{loc.label}» ({loc.region_short_label} · {loc.queue_code})",
+                    callback_data=f"loc:resume_show:{loc.id}:{day_tag}",
+                )
+            ]
+        )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="📍 Керувати локаціями",
+                callback_data="loc:list",
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def change_location_queue_kb(loc: UserLocation) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
-    if loc.city_name:
+    if loc.city_name and (loc.region != REGION_IF or (loc.street_name and loc.house_num)):
         rows.append(
             [
                 InlineKeyboardButton(
@@ -181,7 +268,7 @@ def change_location_queue_kb(loc: UserLocation) -> InlineKeyboardMarkup:
         rows.append(
             [
                 InlineKeyboardButton(
-                    text=f"✅ {q}" if q == loc.queue else f"⚡ {q}",
+                    text=f"✅ {q}" if q == loc.queue_code else f"⚡ {q}",
                     callback_data=f"loc:setq:{loc.id}:{q}",
                 )
                 for q in chunk
@@ -198,35 +285,46 @@ def change_location_queue_kb(loc: UserLocation) -> InlineKeyboardMarkup:
 
 
 def switch_queue_suggestion_kb(loc: UserLocation, new_queue: str) -> InlineKeyboardMarkup:
+    _, new_code = split_queue_key(new_queue)
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text=f"🔄 Перемкнути «{loc.label}» з {loc.queue} на {new_queue}",
-                    callback_data=f"loc:setq:{loc.id}:{new_queue}",
+                    text=f"🔄 Перемкнути «{loc.label}» з {loc.queue_code} на {new_code}",
+                    callback_data=f"loc:setq:{loc.id}:{new_code}",
                 )
             ]
         ]
     )
 
 
-def schedule_view_actions_kb(loc_id: int, day_tag: str = "today") -> InlineKeyboardMarkup:
+def schedule_view_actions_kb(
+    loc_id: int, day_tag: str = "today", is_paused: bool = False
+) -> InlineKeyboardMarkup:
     other_tag = "tomorrow" if day_tag == "today" else "today"
     other_label = "🌅 Переглянути на завтра" if day_tag == "today" else "📅 Переглянути на сьогодні"
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
+    rows: list[list[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton(
+                text="🔄 Оновити зараз",
+                callback_data=f"sched:refresh:{loc_id}:{day_tag}",
+            ),
+            InlineKeyboardButton(
+                text=other_label,
+                callback_data=f"sched:show:{loc_id}:{other_tag}",
+            ),
+        ]
+    ]
+    if is_paused:
+        rows.append(
             [
                 InlineKeyboardButton(
-                    text="🔄 Оновити зараз",
-                    callback_data=f"sched:refresh:{loc_id}:{day_tag}",
-                ),
-                InlineKeyboardButton(
-                    text=other_label,
-                    callback_data=f"sched:show:{loc_id}:{other_tag}",
-                ),
+                    text="🎯 Зробити єдиною активною",
+                    callback_data=f"loc:only_new:{loc_id}",
+                )
             ]
-        ]
-    )
+        )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def settings_kb(user: UserProfile) -> InlineKeyboardMarkup:

@@ -2,8 +2,9 @@ from aiogram.fsm.state import State, StatesGroup
 
 
 class AddLocationStates(StatesGroup):
-    """Кроки додавання нової локації (за чергою або за адресою)."""
+    """Кроки додавання нової локації (область -> спосіб -> черга або адреса)."""
 
+    choosing_region = State()
     choosing_method = State()
     choosing_queue = State()
     entering_city = State()

@@ -418,7 +418,7 @@ def render_schedule_image(
         letter_spacing=1.0 * s,
     )
 
-    queue_text = f"Черга {schedule.queue}"
+    queue_text = f"Черга {schedule.queue_code}"
     q_bbox = draw.textbbox((0, 0), queue_text, font=font_queue_badge)
     q_tw = q_bbox[2] - q_bbox[0]
     badge_w = q_tw + 24 * s

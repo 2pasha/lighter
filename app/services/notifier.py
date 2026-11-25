@@ -15,7 +15,14 @@ except ImportError:
     TelegramRetryAfter = Exception  # type: ignore
     BufferedInputFile = Any  # type: ignore
 
-from app.config import ALL_QUEUES, settings
+from app.config import (
+    ALL_QUEUES,
+    REGION_IF,
+    REGION_VOE,
+    is_valid_queue_key,
+    settings,
+    split_queue_key,
+)
 from app.database import Database, UserLocation, UserProfile
 from app.models import DaySchedule, OutageInterval, SlotState
 from app.services.formatter import (
@@ -145,8 +152,8 @@ class NotificationEngine:
 
         subscriptions = await self.db.get_all_active_subscriptions()
 
-        # 1. Завантажуємо глобальний JSON для всіх черг з GitHub-дзеркала + bezsvitla
-        fetched_schedules = await self.voe_client.fetch_all_queues_from_github()
+        # 1. Завантажуємо актуальні графіки всіх черг для всіх підтримуваних областей
+        fetched_schedules = await self.voe_client.fetch_all_regions_schedules()
 
         # 2. Перевіряємо та синхронізуємо актуальні черги ГПВ для локацій з адресами
         await self.sync_locations_queues(
@@ -155,11 +162,12 @@ class NotificationEngine:
             now=now,
         )
 
-        # 2b. Якщо для якихось активних локацій з адресою немає свіжих даних у глобальному JSON
+        # 2b. Якщо для якихось активних локацій Вінницької обл. з адресою немає свіжих даних у глобальному JSON
         checked_queues_via_address: set[str] = set()
         for _, loc in subscriptions:
             if (
-                loc.city_id
+                loc.region == REGION_VOE
+                and loc.city_id
                 and loc.street_id
                 and loc.house_id
                 and (loc.queue, today) not in fetched_schedules
@@ -178,8 +186,10 @@ class NotificationEngine:
                     for d, sched in addr_res.schedules.items():
                         fetched_schedules[(sched.queue, d)] = sched
 
-        # 3. Опціональний fallback через офіційний бот @pat_voe_bot (якщо увімкнено Telethon)
-        monitored_queues = {loc.queue for _, loc in subscriptions}
+        # 3. Опціональний fallback через офіційний бот (якщо увімкнено Telethon, лише для VOE)
+        monitored_queues = {
+            loc.queue for _, loc in subscriptions if loc.region == REGION_VOE
+        }
         for q in monitored_queues:
             for target_d in (today, tomorrow):
                 if (q, target_d) not in fetched_schedules:
@@ -216,12 +226,13 @@ class NotificationEngine:
         if not subscriptions:
             return 0
 
-        # Групуємо підписки за унікальною адресою, щоб не опитувати одну й ту саму адресу двічі
-        addr_groups: dict[tuple[str, str, str], list[tuple[UserProfile, UserLocation]]] = {}
+        # Групуємо підписки за регіоном та унікальною адресою, щоб не опитувати одну й ту саму адресу двічі
+        addr_groups: dict[tuple[str, str, str, str], list[tuple[UserProfile, UserLocation]]] = {}
         for user, loc in subscriptions:
             if not loc.city_name or not (loc.street_name or loc.city_id):
                 continue
             key = (
+                loc.region,
                 loc.city_name.strip().lower(),
                 (loc.street_name or "").strip().lower(),
                 (loc.house_num or "").strip().lower(),
@@ -234,23 +245,31 @@ class NotificationEngine:
         updated_count = 0
         for _, group in addr_groups.items():
             _, sample_loc = group[0]
-            verified_q = await self.voe_client.verify_address_queue(
-                city_name=sample_loc.city_name or "",
-                street_name=sample_loc.street_name or "",
-                house_num=sample_loc.house_num or "",
-                city_id=sample_loc.city_id or "",
-                street_id=sample_loc.street_id or "",
-                house_id=sample_loc.house_id or "",
-                known_schedules=fetched_schedules,
-            )
+            if sample_loc.region == REGION_IF:
+                verified_q = await self.voe_client.if_client.verify_address_queue(
+                    city_name=sample_loc.city_name or "",
+                    street_name=sample_loc.street_name or "",
+                    house_num=sample_loc.house_num or "",
+                )
+            else:
+                verified_q = await self.voe_client.verify_address_queue(
+                    city_name=sample_loc.city_name or "",
+                    street_name=sample_loc.street_name or "",
+                    house_num=sample_loc.house_num or "",
+                    city_id=sample_loc.city_id or "",
+                    street_id=sample_loc.street_id or "",
+                    house_id=sample_loc.house_id or "",
+                    known_schedules=fetched_schedules,
+                )
             if not verified_q and sample_loc.city_name:
                 verified_q = await self.db.lookup_cached_address(
                     sample_loc.city_name,
                     sample_loc.street_name,
                     sample_loc.house_num,
+                    region=sample_loc.region,
                 )
 
-            if not verified_q or verified_q not in ALL_QUEUES:
+            if not verified_q or not is_valid_queue_key(verified_q):
                 continue
 
             for user, loc in group:
@@ -318,10 +337,14 @@ class NotificationEngine:
         if await self.db.has_alert_been_sent(user.telegram_id, loc.id, alert_key):
             return
 
+        _, old_code = split_queue_key(old_queue)
+        _, new_code = split_queue_key(new_queue)
+        safe_new_q = new_queue.replace(":", "_")
+
         header = (
-            f"⚡🔄 <b>Увага! Вінницяобленерго змінило чергу ГПВ для вашої адреси!</b>\n"
-            f"🔢 Черга змінилася: <b>{old_queue}</b> ➡️ <b>{new_queue}</b>\n"
-            f"<i>Ми автоматично перемкнули локацію «{loc.label}» на чергу <b>{new_queue}</b>.</i>"
+            f"⚡🔄 <b>Увага! Змінилася черга ГПВ для вашої адреси!</b>\n"
+            f"🔢 Черга змінилася: <b>{old_code}</b> ➡️ <b>{new_code}</b>\n"
+            f"<i>Ми автоматично перемкнули локацію «{loc.label}» на чергу <b>{new_code}</b>.</i>"
         )
 
         if schedule_today is not None:
@@ -339,20 +362,20 @@ class NotificationEngine:
         else:
             addr_line = (
                 f"\n🏠 Адреса: <b>{loc.display_address}</b>"
-                if loc.display_address != f"Черга {new_queue}"
+                if loc.display_address != f"Черга {new_code}"
                 else ""
             )
             text = (
                 f"{header}\n\n"
-                f"📍 Локація: <b>{loc.label}</b>{addr_line}\n"
-                f"🔢 Нова черга: <b>{new_queue}</b>"
+                f"📍 Локація: <b>{loc.label}</b> ({loc.region_short_label}){addr_line}\n"
+                f"🔢 Нова черга: <b>{new_code}</b>"
             )
             img_bytes = render_notification_image("schedule_updated")
             sent = await self._safe_send_alert(
                 user.telegram_id,
                 text,
                 img_bytes=img_bytes,
-                filename=f"queue_changed_{loc.id}_{new_queue}.png",
+                filename=f"queue_changed_{loc.id}_{safe_new_q}.png",
             )
 
         if sent:
@@ -652,10 +675,12 @@ class NotificationEngine:
             was_off = is_effective_outage(prev_state)
             will_be_off = is_effective_outage(next_state)
 
+            q_code = loc.queue_code
+            safe_loc_q = loc.queue.replace(":", "_")
             addr_suffix = (
                 f" ({loc.display_address})"
-                if loc.display_address != f"Черга {loc.queue}"
-                else ""
+                if loc.display_address != f"Черга {q_code}"
+                else f" ({loc.region_short_label})"
             )
 
             if not was_off and will_be_off and user.notify_15m_off:
@@ -675,7 +700,8 @@ class NotificationEngine:
                     msg = (
                         f"⚠️🔌 <b>Увага! Відключення світла через 15 хвилин (о {target_time_str})</b>\n\n"
                         f"📍 Локація: <b>{loc.label}</b>{addr_suffix}\n"
-                        f"🔢 Черга: <b>{loc.queue}</b>\n"
+                        f"🗺 Область: <b>{loc.region_label}</b>\n"
+                        f"🔢 Черга: <b>{q_code}</b>\n"
                         f"📌 Статус слоту: {outage_type_str}\n"
                         f"🕒 Орієнтовно до: <b>{end_str}</b> (тривалість: {duration_str})\n\n"
                         f"<i>Рекомендуємо зарядити пристрої та завершити важливі справи за комп'ютером.</i>"
@@ -692,7 +718,7 @@ class NotificationEngine:
                             warn_off_key,
                             msg,
                             img_bytes,
-                            f"warn_off_{loc.queue}_{target_time_str.replace(':', '')}.png",
+                            f"warn_off_{safe_loc_q}_{target_time_str.replace(':', '')}.png",
                         )
                     )
 
@@ -705,7 +731,8 @@ class NotificationEngine:
                     msg = (
                         f"💡🎉 <b>Світло має з'явитися через 15 хвилин (о {target_time_str})!</b>\n\n"
                         f"📍 Локація: <b>{loc.label}</b>{addr_suffix}\n"
-                        f"🔢 Черга: <b>{loc.queue}</b>\n"
+                        f"🗺 Область: <b>{loc.region_label}</b>\n"
+                        f"🔢 Черга: <b>{q_code}</b>\n"
                         f"🟢 Наступне відключення: <b>{next_off_str}</b>"
                     )
                     pending_alerts.append(
@@ -715,7 +742,7 @@ class NotificationEngine:
                             warn_on_key,
                             msg,
                             img_light_on,
-                            f"warn_on_{loc.queue}_{target_time_str.replace(':', '')}.png",
+                            f"warn_on_{safe_loc_q}_{target_time_str.replace(':', '')}.png",
                         )
                     )
 
@@ -823,7 +850,8 @@ class NotificationEngine:
         img_bytes: Optional[bytes],
         schedule: DaySchedule,
     ) -> bool:
-        fname = f"schedule_{schedule.queue}_{schedule.schedule_date}.png"
+        safe_q = schedule.queue.replace(":", "_")
+        fname = f"schedule_{safe_q}_{schedule.schedule_date}.png"
         return await self._safe_send_alert(
             chat_id=chat_id,
             text=text,

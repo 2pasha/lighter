@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import date, datetime
 from typing import Optional
 
+from app.config import get_region_label
 from app.models import DaySchedule, OutageInterval, SlotState
 
 MONTHS_UA = {
@@ -63,11 +64,13 @@ def format_schedule_message(
         lines.append(header_prefix)
         lines.append("")
 
-    loc_title = f"📍 <b>{location_label}</b>" if location_label else f"⚡ <b>Черга {schedule.queue}</b>"
-    if address_str and address_str != f"Черга {schedule.queue}":
+    q_code = schedule.queue_code
+    loc_title = f"📍 <b>{location_label}</b>" if location_label else f"⚡ <b>Черга {q_code}</b>"
+    if address_str and address_str not in (f"Черга {q_code}", f"Черга {schedule.queue}"):
         loc_title += f" ({address_str})"
     lines.append(loc_title)
-    lines.append(f"🔢 Черга: <b>{schedule.queue}</b>")
+    lines.append(f"🗺 Область: <b>{get_region_label(schedule.region)}</b>")
+    lines.append(f"🔢 Черга: <b>{q_code}</b>")
     lines.append(f"📅 Дата: <b>{format_date_ua(schedule.schedule_date)}</b>")
     lines.append("")
 

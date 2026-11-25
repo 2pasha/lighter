@@ -8,7 +8,15 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from app.config import ALL_QUEUES, settings
+from app.config import (
+    ALL_QUEUES,
+    REGION_IF,
+    REGION_VOE,
+    is_valid_queue_key,
+    make_queue_key,
+    settings,
+    split_queue_key,
+)
 from app.database import Database, UserLocation
 from app.models import DaySchedule, SlotState
 from app.services.formatter import format_minutes_human
@@ -162,14 +170,16 @@ def build_widget_payload(
                     _with_upcoming=False,
                 )
 
+    q_code = today_sched.queue_code
     payload: dict[str, Any] = {
         "status": status,
         "slotState": cur_slot_state.value,
         "statusLabelUk": cur_slot_state.label_ua,
-        "currentGroup": f"Group {today_sched.queue}",
-        "currentGroupUk": f"Черга {today_sched.queue}",
-        "queue": today_sched.queue,
-        "locationLabel": location_label or f"Черга {today_sched.queue}",
+        "currentGroup": f"Group {q_code}",
+        "currentGroupUk": f"Черга {q_code}",
+        "queue": q_code,
+        "region": today_sched.region,
+        "locationLabel": location_label or f"Черга {q_code}",
         "timeUntilNextChange": time_en,
         "timeUntilNextChangeUk": time_uk,
         "nextStatusTime": next_time_str or "",
@@ -215,59 +225,98 @@ async def resolve_widget_data(
             include_possible = user.notify_possible
         locations = await db.get_user_locations(user_id)
 
-    # 1. Якщо передано параметр у віджеті (наприклад "3.2" або "Робота")
+    active_locations = [l for l in locations if l.is_active]
+    ordered_locations = active_locations + [l for l in locations if not l.is_active]
+
+    # 1. Якщо передано параметр у віджеті (наприклад "3.2", "if:4.1", "Коломия" або "Робота")
     clean_param = (param or "").strip()
     if clean_param:
+        p_low = clean_param.lower()
+        explicit_region: Optional[str] = None
+        if any(
+            tok in p_low
+            for tok in ("if:", "іф:", "if ", "іф ", "коломия", "франківськ", "прикарпат")
+        ):
+            explicit_region = REGION_IF
+        elif any(tok in p_low for tok in ("voe:", "вое:", "вінниц")):
+            explicit_region = REGION_VOE
+
         q_match = re.search(r"([1-6][.,][1-2])", clean_param)
         if q_match:
-            target_queue = q_match.group(1).replace(",", ".")
-            for loc in locations:
-                if loc.queue == target_queue:
-                    selected_loc = loc
-                    break
+            q_code = q_match.group(1).replace(",", ".")
+            if explicit_region:
+                target_queue = make_queue_key(explicit_region, q_code)
+                for loc in ordered_locations:
+                    if loc.queue == target_queue:
+                        selected_loc = loc
+                        break
+            else:
+                for loc in ordered_locations:
+                    if loc.queue_code == q_code:
+                        selected_loc = loc
+                        target_queue = loc.queue
+                        break
+                if target_queue is None:
+                    default_reg = (
+                        ordered_locations[0].region if ordered_locations else REGION_VOE
+                    )
+                    target_queue = make_queue_key(default_reg, q_code)
         else:
-            for loc in locations:
-                if clean_param.lower() in loc.label.lower():
+            for loc in ordered_locations:
+                haystack = f"{loc.label} {loc.city_name or ''} {loc.region_label}".lower()
+                if p_low in haystack:
                     selected_loc = loc
                     target_queue = loc.queue
                     break
 
-    # 2. Якщо передано конкретний locationId
-    if selected_loc is None and not target_queue and location_id and locations:
-        for loc in locations:
-            if loc.id == location_id:
-                selected_loc = loc
-                target_queue = loc.queue
-                break
-
-    # 3. За замовчуванням беремо першу збережену локацію користувача
+    # 2. Якщо параметр не вказано — автоматично слідуємо за активною локацією користувача:
+    #    якщо defaultLocationId активна -> беремо її; якщо вона поставлена на паузу під час переїзду ->
+    #    автоматично перемикаємо віджет на поточну активну локацію без перевстановлення Svitlo.js!
     if selected_loc is None and not target_queue and locations:
-        selected_loc = locations[0]
+        loc_by_id = (
+            next((l for l in locations if l.id == location_id), None)
+            if location_id
+            else None
+        )
+        if loc_by_id and loc_by_id.is_active:
+            selected_loc = loc_by_id
+        elif active_locations:
+            selected_loc = active_locations[0]
+        elif loc_by_id:
+            selected_loc = loc_by_id
+        else:
+            selected_loc = locations[0]
         target_queue = selected_loc.queue
 
     if selected_loc:
         location_label = selected_loc.label
         target_queue = selected_loc.queue
 
-    if not target_queue or target_queue not in ALL_QUEUES:
+    if not target_queue or not is_valid_queue_key(target_queue):
         target_queue = "3.2"
         if not location_label:
             location_label = f"⚡ Черга {target_queue}"
+    elif not location_label:
+        _, q_disp = split_queue_key(target_queue)
+        location_label = f"⚡ Черга {q_disp}"
 
-    # Завантажуємо графік з БД або з GitHub-дзеркала
+    # Завантажуємо графік з БД або з регіонального джерела
     today_sched = await db.get_schedule(target_queue, today)
     tomorrow_sched = await db.get_schedule(target_queue, tomorrow)
 
     if today_sched is None:
-        all_github = await voe_client.fetch_all_queues_from_github(ttl_seconds=30.0)
-        for (_, d), s in all_github.items():
+        target_region, _ = split_queue_key(target_queue)
+        all_regional = await voe_client.fetch_all_queues_for_region(
+            region=target_region, ttl_seconds=30.0
+        )
+        for (_, d), s in all_regional.items():
             if d > today and s.total_outage_minutes == 0:
                 continue
             await db.save_schedule(s)
-        today_sched = all_github.get((target_queue, today)) or await db.get_schedule(
+        today_sched = all_regional.get((target_queue, today)) or await db.get_schedule(
             target_queue, today
         )
-        tomorrow_sched = all_github.get(
+        tomorrow_sched = all_regional.get(
             (target_queue, tomorrow)
         ) or await db.get_schedule(target_queue, tomorrow)
 

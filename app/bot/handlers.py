@@ -29,21 +29,37 @@ from app.bot.keyboards import (
     broadcast_cancel_kb,
     broadcast_confirm_kb,
     change_location_queue_kb,
+    choose_region_kb,
     label_presets_kb,
     locations_list_kb,
     main_reply_keyboard,
+    make_only_active_kb,
     popular_cities_kb,
     queue_picker_kb,
+    resume_paused_locations_kb,
     schedule_view_actions_kb,
     settings_kb,
     switch_queue_suggestion_kb,
 )
 from app.bot.middlewares import AntiSpamMiddleware
 from app.bot.states import AddLocationStates, BroadcastStates, QuietHoursStates
-from app.config import ALL_QUEUES, settings
+from app.config import (
+    ALL_QUEUES,
+    REGION_IF,
+    REGION_VOE,
+    get_region_label,
+    is_valid_queue_key,
+    make_queue_key,
+    settings,
+    split_queue_key,
+)
 from app.database import Database, UserLocation
 from app.models import DaySchedule
 from app.services.formatter import format_schedule_message
+from app.services.if_client import (
+    format_if_street_display,
+    parse_freeform_if_address,
+)
 from app.services.image_parser import (
     extract_header_queue_and_date,
     parse_voe_schedule_image,
@@ -104,23 +120,24 @@ def setup_routers(
 
         welcome = (
             f"👋 Вітаю, <b>{message.from_user.first_name or 'друже'}</b>!\n\n"
-            "Я — бот моніторингу графіків погодинних відключень світла "
-            "<b>АТ «Вінницяобленерго»</b> ⚡\n\n"
+            "Я — <b>Світло Бот</b> ⚡ Моніторю графіки погодинних відключень світла "
+            "та завчасно попереджаю про зміни й вимкнення.\n\n"
             "🔔 <b>Що я вмію:</b>\n"
             "1️⃣ Сповіщати, щойно з'явиться графік на <b>завтра</b>\n"
             "2️⃣ Миттєво повідомляти, якщо графік <b>змінився</b> протягом дня\n"
             "3️⃣ Попереджати за <b>15 хвилин до вимкнення</b> світла (🔴 та 🟡)\n"
             "4️⃣ Повідомляти за <b>15 хвилин до увімкнення</b> світла 💡\n"
-            "5️⃣ Розпізнавати картинки з <code>@pat_voe_bot</code> — просто перешліть або надішліть мені зображення графіка!"
+            "5️⃣ Відстежувати одразу <b>кілька локацій</b> у різних містах та областях"
         )
         await message.answer(welcome, parse_mode="HTML", reply_markup=main_reply_keyboard())
 
         if not locations:
+            await state.set_state(AddLocationStates.choosing_region)
             await message.answer(
                 "📍 <b>У вас ще немає збережених локацій.</b>\n"
-                "Оберіть зручний спосіб додавання вашої адреси або черги:",
+                "Оберіть область, для якої хочете додати адресу або чергу:",
                 parse_mode="HTML",
-                reply_markup=add_location_method_kb(),
+                reply_markup=choose_region_kb(),
             )
         else:
             await _send_schedules_for_day(message, user.telegram_id, "today")
@@ -128,14 +145,12 @@ def setup_routers(
     @router.message(Command("help"))
     async def cmd_help(message: Message) -> None:
         text = (
-            "ℹ️ <b>Довідка по боту Світло Вінниця:</b>\n\n"
+            "ℹ️ <b>Довідка по Світло Боту:</b>\n\n"
             "• <b>📅 Графік на сьогодні</b> — актуальний розклад по всіх ваших локаціях\n"
             "• <b>🌅 Графік на завтра</b> — розклад на наступну добу\n"
-            "• <b>📍 Мої локації</b> — керування вашими адресами та чергами (можна додати Дім, Роботу, Батьків)\n"
-            "• <b>⚙️ Налаштування</b> — увімкнення/вимкнення типів сповіщень та тихих годин (вночі)\n\n"
-            "💡 <i>Лайфхак:</i> Ви можете в будь-який момент надіслати або переслати сюди "
-            "картинку графіка з офіційного бота <code>@pat_voe_bot</code> — я автоматично "
-            "розпізнаю всі кольорові слоти та оновлю графік!"
+            "• <b>📍 Мої локації</b> — керування вашими адресами та чергами (Івано-Франківська та Вінницька області)\n"
+            "• <b>⚙️ Налаштування</b> — увімкнення/вимкнення типів сповіщень та тихих годин (вночі)\n"
+            "• <b>/widget</b> — персональний віджет для iPhone (Lock Screen та Home Screen)"
         )
         await message.answer(text, parse_mode="HTML", reply_markup=main_reply_keyboard())
 
@@ -152,7 +167,12 @@ def setup_routers(
             first_name=message.from_user.first_name,
         )
         locations = await db.get_user_locations(user.telegram_id)
-        default_loc_id = locations[0].id if locations else None
+        default_loc = (
+            next((l for l in locations if l.is_active), locations[0])
+            if locations
+            else None
+        )
+        default_loc_id = default_loc.id if default_loc else None
 
         # Дозволяємо передати кастомний URL сервера аргументом для тестування: /widget https://...
         raw_text = (message.text or "").strip()
@@ -169,8 +189,9 @@ def setup_routers(
         doc = BufferedInputFile(js_bytes, filename="Svitlo.js")
 
         loc_note = (
-            f"📍 За замовчуванням: <b>{locations[0].label} (Черга {locations[0].queue})</b>\n"
-            if locations
+            f"📍 Активна локація: <b>{default_loc.label} ({default_loc.region_short_label} · Черга {default_loc.queue_code})</b>\n"
+            "<i>Віджет автоматично перемикатиметься слідом за вашою активною локацією в боті!</i>\n"
+            if default_loc
             else "📍 За замовчуванням: <b>Черга 3.2</b> (додайте власну локацію в меню бота)\n"
         )
 
@@ -181,7 +202,7 @@ def setup_routers(
             "1️⃣ Завантажте безкоштовний додаток <a href=\"https://apps.apple.com/app/scriptable/id1405459188\">Scriptable</a> з App Store.\n"
             "2️⃣ Натисніть на файл <code>Svitlo.js</code> вище ➡️ <b>Поділитися (Share)</b> ➡️ оберіть <b>Scriptable</b> (<i>Add to Scriptable</i>).\n"
             "3️⃣ Додайте віджет <b>Scriptable</b> на Екран блокування (Lock Screen) або Домашній екран та оберіть у його налаштуваннях скрипт <b>Svitlo</b>.\n\n"
-            "💡 <i>Підказка:</i> Якщо у вас декілька локацій, ви можете вказати іншу чергу (напр. <code>2.1</code>) або назву локації (напр. <code>Робота</code>) у полі <b>Parameter</b> налаштувань віджета."
+            "💡 <i>Підказка:</i> Якщо у вас декілька локацій, ви можете вказати назву локації чи міста (напр. <code>Коломия</code>, <code>Робота</code>) або чергу (напр. <code>4.1</code>, <code>if:4.1</code>) у полі <b>Parameter</b> налаштувань віджета."
         )
         await message.answer_document(
             document=doc,
@@ -214,24 +235,34 @@ def setup_routers(
         t_locs = time.perf_counter()
         if not locations:
             await message.answer(
-                "📍 Ви ще не додали жодної локації. Додайте чергу або адресу:",
-                reply_markup=add_location_method_kb(),
+                "📍 Ви ще не додали жодної локації. Оберіть вашу область:",
+                reply_markup=choose_region_kb(),
+            )
+            return
+
+        active_locations = [l for l in locations if l.is_active]
+        if not active_locations:
+            await message.answer(
+                "⏸ <b>Усі ваші локації зараз на паузі</b> (сповіщення тимчасово вимкнено).\n"
+                "Оберіть локацію нижче, щоб увімкнути її та переглянути актуальний графік:",
+                parse_mode="HTML",
+                reply_markup=resume_paused_locations_kb(locations, day_tag),
             )
             return
 
         now = datetime.now(settings.tz)
         target_date = now.date() if day_tag == "today" else now.date() + timedelta(days=1)
 
-        for loc in locations:
+        for loc in active_locations:
             t_sched0 = time.perf_counter()
             sched = await _get_or_fetch_schedule(loc, target_date, force_refresh=False)
             t_sched1 = time.perf_counter()
             if not sched:
                 day_label = "сьогодні" if day_tag == "today" else "завтра"
                 await message.answer(
-                    f"📍 <b>{loc.label}</b> (Черга {loc.queue})\n"
+                    f"📍 <b>{loc.label}</b> ({loc.region_short_label} · Черга {loc.queue_code})\n"
                     f"⏳ Графік на <b>{day_label} ({target_date.strftime('%d.%m.%Y')})</b> "
-                    f"ще не опубліковано обленерго.\n"
+                    f"ще не опубліковано.\n"
                     f"<i>Щойно він з'явиться, я одразу надішлю вам сповіщення!</i>",
                     parse_mode="HTML",
                     reply_markup=schedule_view_actions_kb(loc.id, day_tag),
@@ -272,22 +303,31 @@ def setup_routers(
                 return cached
 
         # 2. Якщо в кеші/БД графіка ще немає або натиснуто «🔄 Оновити зараз» (force_refresh=True)
-        all_github = await voe_client.fetch_all_queues_from_github(
-            ttl_seconds=0.0 if force_refresh else 60.0
+        all_regional = await voe_client.fetch_all_queues_for_region(
+            region=loc.region,
+            ttl_seconds=0.0 if force_refresh else 60.0,
         )
 
         # Якщо натиснуто «🔄 Оновити зараз» і локація має адресу — перевіряємо, чи не змінилася черга
-        if force_refresh and loc.city_name and (loc.street_name or loc.city_id):
-            verified_q = await voe_client.verify_address_queue(
-                city_name=loc.city_name,
-                street_name=loc.street_name or "",
-                house_num=loc.house_num or "",
-                city_id=loc.city_id or "",
-                street_id=loc.street_id or "",
-                house_id=loc.house_id or "",
-                known_schedules=all_github,
-            )
-            if verified_q in ALL_QUEUES and verified_q != loc.queue:
+        if force_refresh and loc.city_name:
+            verified_q: Optional[str] = None
+            if loc.region == REGION_IF and loc.street_name and loc.house_num:
+                verified_q = await voe_client.if_client.verify_address_queue(
+                    city_name=loc.city_name,
+                    street_name=loc.street_name,
+                    house_num=loc.house_num,
+                )
+            elif loc.region == REGION_VOE and (loc.street_name or loc.city_id):
+                verified_q = await voe_client.verify_address_queue(
+                    city_name=loc.city_name,
+                    street_name=loc.street_name or "",
+                    house_num=loc.house_num or "",
+                    city_id=loc.city_id or "",
+                    street_id=loc.street_id or "",
+                    house_id=loc.house_id or "",
+                    known_schedules=all_regional,
+                )
+            if verified_q and is_valid_queue_key(verified_q) and verified_q != loc.queue:
                 updated_loc = await db.update_location_queue(
                     loc_id=loc.id,
                     telegram_id=loc.telegram_id,
@@ -298,14 +338,14 @@ def setup_routers(
                     loc.house_id = updated_loc.house_id
 
         target_key = (loc.queue, target_date)
-        if target_key in all_github:
-            cand = all_github[target_key]
+        if target_key in all_regional:
+            cand = all_regional[target_key]
             if target_date <= today or cand.total_outage_minutes > 0:
                 await _save_schedule(cand)
 
-        if all_github:
+        if all_regional:
             asyncio.create_task(
-                _save_other_schedules_bg(all_github, skip_key=target_key, today=today)
+                _save_other_schedules_bg(all_regional, skip_key=target_key, today=today)
             )
 
         if not force_refresh:
@@ -315,13 +355,27 @@ def setup_routers(
                     return None
                 return cached
 
-        if target_key in all_github:
-            cand = all_github[target_key]
+        if target_key in all_regional:
+            cand = all_regional[target_key]
             if target_date <= today or cand.total_outage_minutes > 0:
                 return cand
 
-        # 3. Якщо локація має ID адреси — опитуємо сайт voe.com.ua/disconnection/detailed
-        if loc.city_id and loc.street_id and loc.house_id:
+        # 3. Регіональний fallback за точною адресою
+        if loc.region == REGION_IF and loc.city_name and loc.street_name and loc.house_num:
+            if_res = await voe_client.if_client.lookup_address(
+                loc.city_name, loc.street_name, loc.house_num
+            )
+            if if_res.schedules:
+                for d, s in if_res.schedules.items():
+                    if d > today and s.total_outage_minutes == 0:
+                        continue
+                    s.queue = loc.queue
+                    await _save_schedule(s)
+                if target_date in if_res.schedules:
+                    cand = if_res.schedules[target_date]
+                    if target_date <= today or cand.total_outage_minutes > 0:
+                        return cand
+        elif loc.region == REGION_VOE and loc.city_id and loc.street_id and loc.house_id:
             addr_res = await voe_client.fetch_by_address(
                 city_id=loc.city_id,
                 street_id=loc.street_id,
@@ -354,18 +408,25 @@ def setup_routers(
         day_tag: str,
     ) -> tuple[float, float]:
         t_r0 = time.perf_counter()
+        paused_prefix = (
+            "⏸ <i>Ця локація зараз на паузі (фонові сповіщення вимкнено)</i>"
+            if not loc.is_active
+            else None
+        )
         text = format_schedule_message(
             schedule=sched,
             location_label=loc.label,
             address_str=loc.display_address,
             now=now,
+            header_prefix=paused_prefix,
         )
         img_bytes = render_schedule_image(sched, now=now)
-        kb = schedule_view_actions_kb(loc.id, day_tag)
+        kb = schedule_view_actions_kb(loc.id, day_tag, is_paused=not loc.is_active)
         t_r1 = time.perf_counter()
+        safe_q = sched.queue.replace(":", "_")
 
         if img_bytes and len(text) <= 1000:
-            fname = f"voe_{sched.queue}_{sched.schedule_date}.png"
+            fname = f"svitlo_{safe_q}_{sched.schedule_date}.png"
             if message.bot:
                 await send_photo_cached(
                     bot=message.bot,
@@ -383,7 +444,7 @@ def setup_routers(
                 )
         else:
             if img_bytes:
-                fname = f"voe_{sched.queue}_{sched.schedule_date}.png"
+                fname = f"svitlo_{safe_q}_{sched.schedule_date}.png"
                 if message.bot:
                     await send_photo_cached(
                         bot=message.bot,
@@ -421,7 +482,7 @@ def setup_routers(
         target_date = now.date() if day_tag == "today" else now.date() + timedelta(days=1)
         force = action == "refresh"
         if force:
-            await call.answer("🔄 Оновлюю дані з джерел Вінницяобленерго...")
+            await call.answer("🔄 Оновлюю графік...")
         else:
             await call.answer()
 
@@ -431,7 +492,7 @@ def setup_routers(
         if not sched:
             day_label = "сьогодні" if day_tag == "today" else "завтра"
             await call.message.answer(
-                f"📍 <b>{loc.label}</b> (Черга {loc.queue})\n"
+                f"📍 <b>{loc.label}</b> ({loc.region_short_label} · Черга {loc.queue_code})\n"
                 f"⏳ Графік на <b>{day_label} ({target_date.strftime('%d.%m.%Y')})</b> ще не з'явився.",
                 parse_mode="HTML",
                 reply_markup=schedule_view_actions_kb(loc.id, day_tag),
@@ -456,35 +517,46 @@ def setup_routers(
             send_ms,
         )
 
+    def _format_locations_list_text(locations: list[UserLocation]) -> str:
+        lines = ["📍 <b>Ваші збережені локації:</b>\n"]
+        for loc in locations:
+            status_badge = "🟢" if loc.is_active else "⏸"
+            paused_tag = " <i>(на паузі)</i>" if not loc.is_active else ""
+            addr_suffix = (
+                f" ({loc.display_address})"
+                if loc.display_address != f"Черга {loc.queue_code}"
+                else ""
+            )
+            lines.append(
+                f"{status_badge} <b>{loc.label}</b>{paused_tag} — {loc.region_short_label}, Черга <b>{loc.queue_code}</b>{addr_suffix}"
+            )
+        if len(locations) > 1:
+            lines.append(
+                "\n💡 <i>Кнопка «🎯 Тільки ця» залишає активною лише обрану локацію, а інші зберігає на паузі (без видалення).</i>"
+            )
+        else:
+            lines.append("\nНатисніть на локацію для перегляду графіка або додайте нову:")
+        return "\n".join(lines)
+
     # -------------------------------------------------------------------------
-    # Мої локації: перегляд, додавання, видалення
+    # Мої локації: перегляд, перемикання активності, додавання, видалення
     # -------------------------------------------------------------------------
     @router.message(F.text == BTN_LOCATIONS)
     @router.message(Command("locations"))
-    async def handle_locations(message: Message) -> None:
+    async def handle_locations(message: Message, state: FSMContext) -> None:
         if not message.from_user:
             return
         locations = await db.get_user_locations(message.from_user.id)
         if not locations:
+            await state.set_state(AddLocationStates.choosing_region)
             await message.answer(
-                "📍 У вас ще немає збережених локацій.\nОберіть спосіб додавання:",
-                reply_markup=add_location_method_kb(),
+                "📍 У вас ще немає збережених локацій.\nОберіть вашу область:",
+                reply_markup=choose_region_kb(),
             )
             return
 
-        lines = ["📍 <b>Ваші підключені локації:</b>\n"]
-        for loc in locations:
-            addr_suffix = (
-                f" ({loc.display_address})"
-                if loc.display_address != f"Черга {loc.queue}"
-                else ""
-            )
-            lines.append(
-                f"• <b>{loc.label}</b> — Черга <b>{loc.queue}</b>{addr_suffix}"
-            )
-        lines.append("\nНатисніть на локацію для перегляду графіка або додайте нову:")
         await message.answer(
-            "\n".join(lines),
+            _format_locations_list_text(locations),
             parse_mode="HTML",
             reply_markup=locations_list_kb(locations),
         )
@@ -492,12 +564,13 @@ def setup_routers(
     @router.callback_query(F.data == "loc:add")
     async def cb_loc_add(call: CallbackQuery, state: FSMContext) -> None:
         await state.clear()
+        await state.set_state(AddLocationStates.choosing_region)
         await call.answer()
         if call.message:
             await call.message.answer(
-                "➕ <b>Додавання нової локації</b>\nЯк ви хочете вказати графік?",
+                "➕ <b>Додавання нової локації</b>\nОберіть область:",
                 parse_mode="HTML",
-                reply_markup=add_location_method_kb(),
+                reply_markup=choose_region_kb(),
             )
 
     @router.callback_query(F.data.startswith("loc:view:"))
@@ -516,40 +589,141 @@ def setup_routers(
             await _reply_with_schedule_card(call.message, loc, sched, now, "today")  # type: ignore
         else:
             await call.message.answer(
-                f"📍 <b>{loc.label}</b> (Черга {loc.queue})\n"
+                f"📍 <b>{loc.label}</b> ({loc.region_short_label} · Черга {loc.queue_code})\n"
                 f"Графік на сьогодні ще не завантажено. Натисніть «Оновити зараз».",
                 parse_mode="HTML",
-                reply_markup=schedule_view_actions_kb(loc.id, "today"),
+                reply_markup=schedule_view_actions_kb(
+                    loc.id, "today", is_paused=not loc.is_active
+                ),
             )
 
     @router.callback_query(F.data == "loc:list")
-    async def cb_loc_list(call: CallbackQuery) -> None:
+    async def cb_loc_list(call: CallbackQuery, state: FSMContext) -> None:
         if not call.from_user or not call.message:
             return
         await call.answer()
         locations = await db.get_user_locations(call.from_user.id)
         if not locations:
+            await state.set_state(AddLocationStates.choosing_region)
             await call.message.edit_text(
-                "📍 У вас ще немає збережених локацій.\nОберіть спосіб додавання:",
-                reply_markup=add_location_method_kb(),
+                "📍 У вас ще немає збережених локацій.\nОберіть вашу область:",
+                reply_markup=choose_region_kb(),
             )
             return
-        lines = ["📍 <b>Ваші підключені локації:</b>\n"]
-        for loc in locations:
-            addr_suffix = (
-                f" ({loc.display_address})"
-                if loc.display_address != f"Черга {loc.queue}"
-                else ""
-            )
-            lines.append(
-                f"• <b>{loc.label}</b> — Черга <b>{loc.queue}</b>{addr_suffix}"
-            )
-        lines.append("\nНатисніть на локацію для перегляду графіка або змініть чергу:")
         await call.message.edit_text(
-            "\n".join(lines),
+            _format_locations_list_text(locations),
             parse_mode="HTML",
             reply_markup=locations_list_kb(locations),
         )
+
+    @router.callback_query(F.data.startswith("loc:toggle:"))
+    async def cb_loc_toggle(call: CallbackQuery) -> None:
+        if not call.data or not call.from_user or not call.message:
+            return
+        loc_id = int(call.data.split(":")[2])
+        loc = await db.get_location_by_id(loc_id, call.from_user.id)
+        if not loc:
+            await call.answer("Локацію не знайдено", show_alert=True)
+            return
+
+        new_active = not loc.is_active
+        await db.set_location_active(loc_id, call.from_user.id, new_active)
+        locations = await db.get_user_locations(call.from_user.id)
+        toast = (
+            f"🔔 Сповіщення для «{loc.label}» увімкнено"
+            if new_active
+            else f"🔕 «{loc.label}» поставлено на паузу"
+        )
+        await call.answer(toast)
+        try:
+            await call.message.edit_text(
+                _format_locations_list_text(locations),
+                parse_mode="HTML",
+                reply_markup=locations_list_kb(locations),
+            )
+        except Exception:
+            await call.message.answer(
+                _format_locations_list_text(locations),
+                parse_mode="HTML",
+                reply_markup=locations_list_kb(locations),
+            )
+
+    @router.callback_query(F.data.startswith("loc:only:"))
+    async def cb_loc_only(call: CallbackQuery) -> None:
+        if not call.data or not call.from_user or not call.message:
+            return
+        loc_id = int(call.data.split(":")[2])
+        target = await db.set_only_location_active(loc_id, call.from_user.id)
+        if not target:
+            await call.answer("Локацію не знайдено", show_alert=True)
+            return
+
+        locations = await db.get_user_locations(call.from_user.id)
+        await call.answer(f"🎯 Активна лише «{target.label}»!")
+        try:
+            await call.message.edit_text(
+                _format_locations_list_text(locations),
+                parse_mode="HTML",
+                reply_markup=locations_list_kb(locations),
+            )
+        except Exception:
+            await call.message.answer(
+                _format_locations_list_text(locations),
+                parse_mode="HTML",
+                reply_markup=locations_list_kb(locations),
+            )
+
+    @router.callback_query(F.data.startswith("loc:only_new:"))
+    async def cb_loc_only_new(call: CallbackQuery) -> None:
+        if not call.data or not call.from_user or not call.message:
+            return
+        loc_id = int(call.data.split(":")[2])
+        target = await db.set_only_location_active(loc_id, call.from_user.id)
+        if not target:
+            await call.answer("Локацію не знайдено", show_alert=True)
+            return
+
+        await call.answer(f"🎯 Активна лише «{target.label}»!")
+        msg_txt = (
+            f"🎯 Готово! Зараз активна лише локація <b>{target.label}</b> "
+            f"({target.region_short_label} · Черга <b>{target.queue_code}</b>).\n"
+            "<i>Інші локації збережено на паузі — перемкнутися назад можна в будь-який момент у «📍 Мої локації».</i>"
+        )
+        if getattr(call.message, "photo", None):
+            try:
+                await call.message.edit_reply_markup(
+                    reply_markup=schedule_view_actions_kb(target.id, "today", is_paused=False)
+                )
+            except Exception:
+                pass
+            await call.message.answer(msg_txt, parse_mode="HTML")
+        else:
+            try:
+                await call.message.edit_text(msg_txt, parse_mode="HTML")
+            except Exception:
+                await call.message.answer(msg_txt, parse_mode="HTML")
+
+    @router.callback_query(F.data.startswith("loc:resume_show:"))
+    async def cb_loc_resume_and_show(call: CallbackQuery) -> None:
+        if not call.data or not call.from_user or not call.message:
+            return
+        parts = call.data.split(":")
+        loc_id = int(parts[2])
+        day_tag = parts[3] if len(parts) > 3 else "today"
+        loc = await db.set_location_active(loc_id, call.from_user.id, True)
+        if not loc:
+            await call.answer("Локацію не знайдено", show_alert=True)
+            return
+
+        await call.answer(f"🔔 «{loc.label}» увімкнено!")
+        try:
+            await call.message.edit_text(
+                f"🔔 Локацію <b>{loc.label}</b> ({loc.region_short_label} · Черга <b>{loc.queue_code}</b>) знову увімкнено!",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+        await _send_schedules_for_day(call.message, call.from_user.id, day_tag)  # type: ignore
 
     @router.callback_query(F.data.startswith("loc:chq:"))
     async def cb_loc_change_queue_menu(call: CallbackQuery) -> None:
@@ -563,12 +737,13 @@ def setup_routers(
         await call.answer()
         addr_line = (
             f"\n🏠 Адреса: <b>{loc.display_address}</b>"
-            if loc.display_address != f"Черга {loc.queue}"
+            if loc.display_address != f"Черга {loc.queue_code}"
             else ""
         )
         await call.message.edit_text(
-            f"🔢 <b>Зміна черги ГПВ для локації «{loc.label}»</b>{addr_line}\n"
-            f"Поточна черга: <b>{loc.queue}</b>\n\n"
+            f"🔢 <b>Зміна черги ГПВ для локації «{loc.label}»</b>\n"
+            f"🗺 Область: <b>{loc.region_label}</b>{addr_line}\n"
+            f"Поточна черга: <b>{loc.queue_code}</b>\n\n"
             "Оберіть нову чергу зі списку нижче або натисніть перевірку за адресою:",
             parse_mode="HTML",
             reply_markup=change_location_queue_kb(loc),
@@ -585,22 +760,31 @@ def setup_routers(
             return
 
         await call.answer("🔍 Перевіряю актуальну чергу за вашою адресою...")
-        all_github = await voe_client.fetch_all_queues_from_github()
-        verified_q = await voe_client.verify_address_queue(
-            city_name=loc.city_name or "",
-            street_name=loc.street_name or "",
-            house_num=loc.house_num or "",
-            city_id=loc.city_id or "",
-            street_id=loc.street_id or "",
-            house_id=loc.house_id or "",
-            known_schedules=all_github,
-        )
-        if not verified_q and loc.city_name:
-            verified_q = await db.lookup_cached_address(
-                loc.city_name, loc.street_name, loc.house_num
+        verified_q: Optional[str] = None
+        if loc.region == REGION_IF:
+            verified_q = await voe_client.if_client.verify_address_queue(
+                city_name=loc.city_name or "",
+                street_name=loc.street_name or "",
+                house_num=loc.house_num or "",
+            )
+        else:
+            all_github = await voe_client.fetch_all_queues_from_github()
+            verified_q = await voe_client.verify_address_queue(
+                city_name=loc.city_name or "",
+                street_name=loc.street_name or "",
+                house_num=loc.house_num or "",
+                city_id=loc.city_id or "",
+                street_id=loc.street_id or "",
+                house_id=loc.house_id or "",
+                known_schedules=all_github,
             )
 
-        if not verified_q or verified_q not in ALL_QUEUES:
+        if not verified_q and loc.city_name:
+            verified_q = await db.lookup_cached_address(
+                loc.city_name, loc.street_name, loc.house_num, region=loc.region
+            )
+
+        if not verified_q or not is_valid_queue_key(verified_q):
             await call.message.edit_text(
                 f"⚠️ Не вдалося автоматично визначити чергу для адреси <b>{loc.display_address}</b>.\n"
                 "Будь ласка, оберіть актуальну чергу вручну:",
@@ -609,16 +793,17 @@ def setup_routers(
             )
             return
 
+        _, verified_code = split_queue_key(verified_q)
         if verified_q == loc.queue:
             await call.message.edit_text(
-                f"✅ За даними довідника для <b>{loc.display_address}</b> встановлена черга <b>{loc.queue}</b>.\n\n"
-                "Якщо на сайті <code>disconnection.voe.com.ua</code> або в <code>@pat_voe_bot</code> вашу адресу перемкнули на іншу лінію, оберіть нову чергу нижче:",
+                f"✅ За даними довідника для <b>{loc.display_address}</b> встановлена черга <b>{loc.queue_code}</b>.\n\n"
+                "Якщо вашу лінію тимчасово перемкнули на іншу підчергу, ви можете обрати її вручну нижче:",
                 parse_mode="HTML",
                 reply_markup=change_location_queue_kb(loc),
             )
             return
 
-        old_q = loc.queue
+        old_code = loc.queue_code
         updated_loc = await db.update_location_queue(
             loc_id=loc.id,
             telegram_id=call.from_user.id,
@@ -628,7 +813,7 @@ def setup_routers(
         await call.message.edit_text(
             f"⚡🔄 <b>Чергу оновлено!</b>\n"
             f"📍 Локація: <b>{loc.label}</b> ({loc.display_address})\n"
-            f"🔢 Була черга: <b>{old_q}</b> ➡️ Нова черга: <b>{verified_q}</b>",
+            f"🔢 Була черга: <b>{old_code}</b> ➡️ Нова черга: <b>{verified_code}</b>",
             parse_mode="HTML",
         )
         now = datetime.now(settings.tz)
@@ -644,8 +829,8 @@ def setup_routers(
         if len(parts) < 4:
             return
         loc_id = int(parts[2])
-        new_queue = parts[3]
-        if new_queue not in ALL_QUEUES:
+        new_queue_code = parts[3]
+        if new_queue_code not in ALL_QUEUES:
             await call.answer("Невірна черга", show_alert=True)
             return
 
@@ -654,31 +839,37 @@ def setup_routers(
             await call.answer("Локацію не знайдено", show_alert=True)
             return
 
-        old_queue = loc.queue
+        old_code = loc.queue_code
+        resolved_new_key = make_queue_key(loc.region, new_queue_code)
         updated_loc = await db.update_location_queue(
             loc_id=loc.id,
             telegram_id=call.from_user.id,
-            new_queue=new_queue,
+            new_queue=resolved_new_key,
         )
         loc = updated_loc or loc
 
         # Якщо локація має точну адресу — оновлюємо in-memory override та синхронізуємо сусідів
         if loc.city_name and loc.street_name and loc.house_num:
-            voe_client.address_index.set_address_override(
-                loc.city_name, loc.street_name, loc.house_num, new_queue
-            )
+            if loc.region == REGION_IF:
+                voe_client.if_client.set_address_override(
+                    loc.city_name, loc.street_name, loc.house_num, new_queue_code
+                )
+            else:
+                voe_client.address_index.set_address_override(
+                    loc.city_name, loc.street_name, loc.house_num, new_queue_code
+                )
             if notifier is not None:
                 asyncio.create_task(notifier.sync_locations_queues())
 
-        await call.answer(f"✅ Чергу змінено на {new_queue}!")
+        await call.answer(f"✅ Чергу змінено на {new_queue_code}!")
         try:
             await call.message.edit_text(
-                f"✅ Для локації <b>{loc.label}</b> встановлено чергу <b>{new_queue}</b> (була {old_queue}).",
+                f"✅ Для локації <b>{loc.label}</b> ({loc.region_short_label}) встановлено чергу <b>{new_queue_code}</b> (була {old_code}).",
                 parse_mode="HTML",
             )
         except Exception:
             await call.message.answer(
-                f"✅ Для локації <b>{loc.label}</b> встановлено чергу <b>{new_queue}</b> (була {old_queue}).",
+                f"✅ Для локації <b>{loc.label}</b> ({loc.region_short_label}) встановлено чергу <b>{new_queue_code}</b> (була {old_code}).",
                 parse_mode="HTML",
             )
 
@@ -688,7 +879,7 @@ def setup_routers(
             await _reply_with_schedule_card(call.message, loc, sched, now, "today")  # type: ignore
 
     @router.callback_query(F.data.startswith("loc:del:"))
-    async def cb_loc_del(call: CallbackQuery) -> None:
+    async def cb_loc_del(call: CallbackQuery, state: FSMContext) -> None:
         if not call.data or not call.from_user or not call.message:
             return
         loc_id = int(call.data.split(":")[2])
@@ -701,15 +892,20 @@ def setup_routers(
 
         locations = await db.get_user_locations(call.from_user.id)
         if not locations:
+            await state.set_state(AddLocationStates.choosing_region)
             await call.message.edit_text(
-                "📍 Усі локації видалено. Додайте нову локацію:",
-                reply_markup=add_location_method_kb(),
+                "📍 Усі локації видалено. Оберіть область для нової локації:",
+                reply_markup=choose_region_kb(),
             )
         else:
-            await call.message.edit_reply_markup(reply_markup=locations_list_kb(locations))
+            await call.message.edit_text(
+                _format_locations_list_text(locations),
+                parse_mode="HTML",
+                reply_markup=locations_list_kb(locations),
+            )
 
     # -------------------------------------------------------------------------
-    # FSM: Додавання локації (за чергою або за адресою)
+    # FSM: Додавання локації (Область -> Черга або Адреса -> Назва)
     # -------------------------------------------------------------------------
     @router.callback_query(F.data == "addloc:cancel")
     async def cb_addloc_cancel(call: CallbackQuery, state: FSMContext) -> None:
@@ -718,12 +914,46 @@ def setup_routers(
         if call.message:
             await call.message.edit_text("❌ Додавання локації скасовано.")
 
+    @router.callback_query(F.data == "addloc:back_reg")
+    async def cb_addloc_back_reg(call: CallbackQuery, state: FSMContext) -> None:
+        await state.clear()
+        await state.set_state(AddLocationStates.choosing_region)
+        await call.answer()
+        if call.message:
+            await call.message.edit_text(
+                "🗺 <b>Оберіть область:</b>",
+                parse_mode="HTML",
+                reply_markup=choose_region_kb(),
+            )
+
+    @router.callback_query(F.data.startswith("addloc:reg:"))
+    async def cb_addloc_choose_region(call: CallbackQuery, state: FSMContext) -> None:
+        if not call.data or not call.message:
+            return
+        chosen_region = call.data.split(":")[2]
+        if chosen_region not in (REGION_IF, REGION_VOE):
+            chosen_region = REGION_VOE
+        await state.clear()
+        await state.update_data(region=chosen_region)
+        await state.set_state(AddLocationStates.choosing_method)
+        await call.answer()
+        await call.message.edit_text(
+            f"🗺 Область: <b>{get_region_label(chosen_region)}</b>\n\n"
+            "Оберіть зручний спосіб додавання вашої локації:",
+            parse_mode="HTML",
+            reply_markup=add_location_method_kb(chosen_region),
+        )
+
     @router.callback_query(F.data == "addloc:method:queue")
     async def cb_addloc_method_queue(call: CallbackQuery, state: FSMContext) -> None:
+        data = await state.get_data()
+        region = data.get("region") or REGION_VOE
+        await state.update_data(region=region)
         await state.set_state(AddLocationStates.choosing_queue)
         await call.answer()
         if call.message:
             await call.message.edit_text(
+                f"🗺 Область: <b>{get_region_label(region)}</b>\n"
                 "🔢 <b>Оберіть вашу чергу (підчергу) ГПВ:</b>",
                 parse_mode="HTML",
                 reply_markup=queue_picker_kb(),
@@ -735,12 +965,15 @@ def setup_routers(
     async def cb_addloc_pick_queue(call: CallbackQuery, state: FSMContext) -> None:
         if not call.data or not call.message:
             return
-        queue = call.data.split(":")[2]
-        await state.update_data(queue=queue)
+        queue_code = call.data.split(":")[2]
+        data = await state.get_data()
+        region = data.get("region") or REGION_VOE
+        full_queue = make_queue_key(region, queue_code)
+        await state.update_data(queue=full_queue)
         await state.set_state(AddLocationStates.entering_label)
         await call.answer()
         await call.message.edit_text(
-            f"✅ Обрано чергу <b>{queue}</b>.\n\n"
+            f"✅ Обрано: <b>{get_region_label(region, short=True)} · Черга {queue_code}</b>\n\n"
             "🏷 Тепер оберіть назву для цієї локації або просто напишіть свою (наприклад: <i>Квартира</i>, <i>Кав'ярня</i>):",
             parse_mode="HTML",
             reply_markup=label_presets_kb(),
@@ -753,15 +986,127 @@ def setup_routers(
         if call.message:
             await call.message.edit_text(
                 "📸 <b>Розпізнавання графіка за зображенням</b>\n\n"
-                "Просто надішліть або перешліть мені картинку розкладу з офіційного бота "
-                "<code>@pat_voe_bot</code> у цей чат.\n"
+                "Надішліть або перешліть мені картинку таблиці розкладу на 24 години у цей чат.\n"
                 "У підписі до фото можете вказати вашу чергу (наприклад <code>3.2</code>)!",
                 parse_mode="HTML",
             )
 
+    async def _resolve_if_address_and_proceed(
+        message: Message,
+        state: FSMContext,
+        city_name: str,
+        street_name: str,
+        house_num: str,
+    ) -> None:
+        """Визначає чергу за адресою в Івано-Франківській області та переводить у вибір назви."""
+        res = await voe_client.if_client.lookup_address(city_name, street_name, house_num)
+        await state.update_data(
+            region=REGION_IF,
+            city_id="if",
+            city_name=res.city_display or city_name,
+            street_id="if_st",
+            street_name=res.street_display or street_name,
+            house_num=res.house_display or house_num,
+        )
+        disp_addr = ", ".join(
+            p for p in (res.city_display or city_name, res.street_display or street_name, res.house_display or house_num) if p
+        )
+
+        if res.status == "exact" and res.queue_key and res.queue_code:
+            for s in res.schedules.values():
+                await _save_schedule(s)
+            await state.update_data(queue=res.queue_key)
+            await state.set_state(AddLocationStates.entering_label)
+            await message.answer(
+                f"✅ Адресу знайдено: <b>{disp_addr}</b>\n"
+                f"🔢 Ваша черга ГПВ: <b>{res.queue_code}</b>\n\n"
+                "🏷 Оберіть назву для цієї локації або напишіть свою:",
+                parse_mode="HTML",
+                reply_markup=label_presets_kb(),
+            )
+            return
+
+        if res.status == "many" and res.possible_queues:
+            await state.set_state(AddLocationStates.choosing_queue)
+            await message.answer(
+                f"🏠 За адресою <b>{disp_addr}</b> можливі декілька черг: "
+                f"<b>{', '.join(res.possible_queues)}</b>.\n"
+                "Оберіть вашу чергу зі списку:",
+                parse_mode="HTML",
+                reply_markup=queue_picker_kb(allowed_queues=res.possible_queues),
+            )
+            return
+
+        cached_q = await db.lookup_cached_address(
+            res.city_display or city_name,
+            res.street_display or street_name,
+            res.house_display or house_num,
+            region=REGION_IF,
+        )
+        if cached_q and is_valid_queue_key(cached_q):
+            _, c_code = split_queue_key(cached_q)
+            await state.update_data(queue=cached_q)
+            await state.set_state(AddLocationStates.entering_label)
+            await message.answer(
+                f"✅ Адресу знайдено: <b>{disp_addr}</b>\n"
+                f"🔢 Ваша черга ГПВ: <b>{c_code}</b>\n\n"
+                "🏷 Оберіть назву для цієї локації або напишіть свою:",
+                parse_mode="HTML",
+                reply_markup=label_presets_kb(),
+            )
+            return
+
+        if res.status == "no_queue":
+            await state.set_state(AddLocationStates.choosing_queue)
+            await message.answer(
+                f"ℹ️ За адресою <b>{disp_addr}</b> графіки погодинних вимкнень не застосовуються.\n"
+                "Якщо ви все одно хочете відстежувати певну чергу, оберіть її зі списку:",
+                parse_mode="HTML",
+                reply_markup=queue_picker_kb(),
+            )
+            return
+
+        await state.set_state(AddLocationStates.choosing_queue)
+        await message.answer(
+            f"⚠️ Не вдалося автоматично знайти адресу <b>{disp_addr}</b> у базі.\n"
+            "Перевірте правильність назви вулиці/номера або оберіть вашу чергу ГПВ вручну:",
+            parse_mode="HTML",
+            reply_markup=queue_picker_kb(),
+        )
+
     # Пошук за адресою: Крок 1 — Місто або швидкий пошук одним рядком
     @router.callback_query(F.data == "addloc:method:address")
     async def cb_addloc_method_address(call: CallbackQuery, state: FSMContext) -> None:
+        data = await state.get_data()
+        region = data.get("region") or REGION_VOE
+        await state.update_data(region=region)
+
+        if region == REGION_IF:
+            if_popular = [
+                AutocompleteItem(id=c["id"], label=c["label"])
+                for c in voe_client.if_client.get_popular_cities(limit=10)
+            ]
+            await state.update_data(
+                city_candidates=[
+                    {"id": c.id, "label": c.label, "queue": None}
+                    for c in if_popular
+                ]
+            )
+            await state.set_state(AddLocationStates.entering_city)
+            await call.answer()
+            if call.message:
+                await call.message.edit_text(
+                    "🏙 <b>Пошук черги за адресою (Івано-Франківська область)</b>\n\n"
+                    "1️⃣ <b>Оберіть населений пункт</b> із популярних нижче або введіть назву будь-якого міста чи села області "
+                    "(наприклад: <code>Коломия</code>, <code>Івано-Франківськ</code>, <code>Шепарівці</code>).\n\n"
+                    "2️⃣ Або <b>напишіть одразу повну адресу</b> одним рядком "
+                    "(наприклад: <code>Коломия Чорновола 1</code> або <code>Коломия, Січових Стрільців, 10</code>) — "
+                    "і я миттєво знайду вашу чергу!",
+                    parse_mode="HTML",
+                    reply_markup=popular_cities_kb(if_popular, "addloc:city"),
+                )
+            return
+
         popular = voe_client.get_popular_cities(limit=10)
         await state.update_data(
             city_candidates=[
@@ -773,7 +1118,7 @@ def setup_routers(
         await call.answer()
         if call.message:
             await call.message.edit_text(
-                "🏙 <b>Пошук черги за адресою</b>\n\n"
+                "🏙 <b>Пошук черги за адресою (Вінницька область)</b>\n\n"
                 "1️⃣ <b>Оберіть населений пункт</b> із популярних нижче або введіть назву міста/села "
                 "(наприклад: <code>Вінниця</code>, <code>Ладижин</code>, <code>Бар</code>).\n\n"
                 "2️⃣ Або <b>напишіть одразу повну адресу</b> одним рядком "
@@ -790,8 +1135,49 @@ def setup_routers(
             await message.answer("Введіть щонайменше 2 літери назви населеного пункту або адреси:")
             return
 
+        data = await state.get_data()
+        region = data.get("region") or REGION_VOE
+
+        if region == REGION_IF:
+            # 1. Спроба розпізнати повну адресу одним рядком (напр. "Коломия Чорновола 1")
+            if re.search(r"\d", query) or query.count(",") >= 2:
+                parsed_free = parse_freeform_if_address(query)
+                if parsed_free:
+                    c_part, st_part, h_part = parsed_free
+                    await _resolve_if_address_and_proceed(
+                        message, state, c_part, st_part, h_part
+                    )
+                    return
+
+            if_cities_raw = voe_client.if_client.search_cities(query, limit=10)
+            if len(if_cities_raw) == 1:
+                only = if_cities_raw[0]
+                await _proceed_with_chosen_city(
+                    message,
+                    state,
+                    {"id": only["id"], "label": only["label"], "queue": None},
+                    edit=False,
+                )
+                return
+
+            if_items = [
+                AutocompleteItem(id=c["id"], label=c["label"]) for c in if_cities_raw
+            ]
+            await state.update_data(
+                city_candidates=[
+                    {"id": c.id, "label": c.label, "queue": None}
+                    for c in if_items[:10]
+                ]
+            )
+            await state.set_state(AddLocationStates.selecting_city)
+            await message.answer(
+                "🏙 Оберіть ваш населений пункт зі списку:",
+                reply_markup=autocomplete_items_kb(if_items, "addloc:city"),
+            )
+            return
+
         # 1. Якщо запит містить номер будинку, кому або кілька слів (вулиця + будинок) —
-        # пробуємо швидкий пошук повної адреси одним рядком
+        # пробуємо швидкий пошук повної адреси одним рядком (Вінницька область)
         has_digits_or_comma = bool(re.search(r"\d|,", query))
         cities = await voe_client.search_cities(query)
 
@@ -870,9 +1256,27 @@ def setup_routers(
     ) -> None:
         city_id = chosen["id"]
         city_name = chosen["label"]
-        await state.update_data(city_id=city_id, city_name=city_name)
+        data = await state.get_data()
+        region = data.get("region") or (
+            REGION_IF if str(city_id).startswith("if") else REGION_VOE
+        )
+        await state.update_data(region=region, city_id=city_id, city_name=city_name)
 
-        # Перевіряємо, чи має населений пункт деталізацію за вулицями в локальному індексі
+        if region == REGION_IF:
+            await state.set_state(AddLocationStates.entering_street)
+            txt = (
+                f"🏙 Населений пункт: <b>{city_name}</b>\n\n"
+                "🛣 <b>Крок 2 із 3: Вулиця</b>\n"
+                "Введіть назву вулиці або одразу вулицю з номером будинку "
+                "(наприклад: <code>Чорновола 1</code> або <code>Січових Стрільців</code>):"
+            )
+            if edit:
+                await msg_or_call_msg.edit_text(txt, parse_mode="HTML")
+            else:
+                await msg_or_call_msg.answer(txt, parse_mode="HTML")
+            return
+
+        # Перевіряємо, чи має населений пункт деталізацію за вулицями в локальному індексі VOE
         c_obj = voe_client.address_index.get_city(city_id)
         if c_obj and not c_obj.get("streets"):
             c_queues = c_obj.get("queues", [])
@@ -944,14 +1348,36 @@ def setup_routers(
             return
 
         data = await state.get_data()
+        region = data.get("region") or REGION_VOE
         city_id = data.get("city_id", "")
         city_name = data.get("city_name", "")
 
-        # Якщо користувач ввів одразу вулицю та номер будинку (напр. "Соборна 24")
         hm = re.search(
             r"(?:[,\s]+(?:буд\.?|будинок|№)?\s*|\s+)(\d+[а-яіїєґА-ЯІЇЄҐa-zA-Z]?(?:/\d+[а-яіїєґА-ЯІЇЄҐa-zA-Z]?)?)$",
             query,
         )
+
+        if region == REGION_IF:
+            if hm and query[: hm.start()].strip(" ,;."):
+                street_part = query[: hm.start()].strip(" ,;.")
+                house_part = hm.group(1).strip()
+                await _resolve_if_address_and_proceed(
+                    message, state, city_name, street_part, house_part
+                )
+                return
+
+            street_disp = format_if_street_display(query)
+            await state.update_data(street_id="if_st", street_name=street_disp)
+            await state.set_state(AddLocationStates.entering_house)
+            await message.answer(
+                f"🏙 {city_name}, <b>{street_disp}</b>\n\n"
+                "🏠 <b>Крок 3 із 3: Номер будинку</b>\n"
+                "Введіть номер будинку (наприклад: <code>10</code>, <code>25А</code>):",
+                parse_mode="HTML",
+            )
+            return
+
+        # Якщо користувач ввів одразу вулицю та номер будинку (Вінницька обл., напр. "Соборна 24")
         if hm and query[: hm.start()].strip(" ,;."):
             street_part = query[: hm.start()].strip(" ,;.")
             house_part = hm.group(1).strip()
@@ -1062,11 +1488,12 @@ def setup_routers(
         house_query: str,
     ) -> None:
         data = await state.get_data()
-        city_id = data.get("city_id", "")
         city_name = data.get("city_name", "")
 
         # Спочатку перевіряємо кеш бази даних
-        cached_q = await db.lookup_cached_address(city_name, street_name, house_query)
+        cached_q = await db.lookup_cached_address(
+            city_name, street_name, house_query, region=REGION_VOE
+        )
         houses = await voe_client.search_houses(street_id, house_query)
 
         if len(houses) == 1 and houses[0].queue:
@@ -1087,11 +1514,12 @@ def setup_routers(
             return
 
         if cached_q and not houses:
+            _, cached_code = split_queue_key(cached_q)
             await state.update_data(house_num=house_query, queue=cached_q)
             await state.set_state(AddLocationStates.entering_label)
             await message.answer(
                 f"✅ Адресу знайдено: <b>{city_name}, {street_name}, {house_query}</b>\n"
-                f"🔢 Ваша черга ГПВ: <b>{cached_q}</b>\n\n"
+                f"🔢 Ваша черга ГПВ: <b>{cached_code}</b>\n\n"
                 "🏷 Оберіть назву для цієї локації або напишіть свою:",
                 parse_mode="HTML",
                 reply_markup=label_presets_kb(),
@@ -1138,8 +1566,17 @@ def setup_routers(
     async def msg_entering_house(message: Message, state: FSMContext) -> None:
         query = (message.text or "").strip()
         data = await state.get_data()
+        region = data.get("region") or REGION_VOE
+        city_name = data.get("city_name", "")
         street_id = data.get("street_id", "")
         street_name = data.get("street_name", "")
+
+        if region == REGION_IF:
+            await _resolve_if_address_and_proceed(
+                message, state, city_name, street_name, query
+            )
+            return
+
         await _resolve_or_pick_house(message, state, street_id, street_name, query)
 
     @router.callback_query(
@@ -1276,7 +1713,10 @@ def setup_routers(
         message: Message, telegram_id: int, label: str, state: FSMContext
     ) -> None:
         data = await state.get_data()
-        queue = data.get("queue", "1.1")
+        region = data.get("region") or REGION_VOE
+        raw_queue = data.get("queue", "1.1")
+        queue = raw_queue if ":" in raw_queue else make_queue_key(region, raw_queue)
+
         await db.upsert_user(telegram_id=telegram_id)
         loc = await db.add_location(
             telegram_id=telegram_id,
@@ -1290,12 +1730,27 @@ def setup_routers(
             house_id=data.get("house_id"),
         )
         await state.clear()
+        all_user_locs = await db.get_user_locations(telegram_id)
+        other_active = [
+            l for l in all_user_locs if l.id != loc.id and l.is_active
+        ]
+
         await message.answer(
-            f"🎉 Локацію <b>{loc.label}</b> (Черга <b>{loc.queue}</b>) успішно збережено!\n"
+            f"🎉 Локацію <b>{loc.label}</b> ({loc.region_short_label} · Черга <b>{loc.queue_code}</b>) успішно збережено!\n"
             "Тепер ви отримуватимете всі сповіщення про графіки та відключення за 15 хвилин.",
             parse_mode="HTML",
             reply_markup=main_reply_keyboard(),
         )
+        if other_active:
+            other_names = ", ".join(f"«{l.label}»" for l in other_active[:3])
+            await message.answer(
+                f"🧳 <b>Переїхали тимчасово?</b>\n"
+                f"У вас також активні сповіщення для {other_names}. "
+                f"Натисніть кнопку нижче, якщо хочете отримувати сповіщення <b>лише для «{loc.label}»</b>, зберігши інші локації на паузі:",
+                parse_mode="HTML",
+                reply_markup=make_only_active_kb(loc.id, loc.label),
+            )
+
         now = datetime.now(settings.tz)
         sched = await _get_or_fetch_schedule(loc, now.date(), force_refresh=False)
         if sched:
@@ -1510,7 +1965,7 @@ def setup_routers(
             await status_msg.edit_text(stats_text, parse_mode="HTML")
 
     # -------------------------------------------------------------------------
-    # Розпізнавання надісланого користувачем зображення з @pat_voe_bot
+    # Розпізнавання надісланого користувачем зображення графіка
     # -------------------------------------------------------------------------
     @router.message(F.photo)
     async def handle_uploaded_schedule_photo(message: Message, bot: Bot) -> None:
@@ -1520,7 +1975,8 @@ def setup_routers(
         # Визначаємо чергу та дату з підпису або з першої локації користувача
         caption = message.caption or ""
         locations = await db.get_user_locations(message.from_user.id)
-        default_queue = locations[0].queue if locations else "3.2"
+        voe_locs = [l for l in locations if l.region == REGION_VOE]
+        default_queue = voe_locs[0].queue_code if voe_locs else "3.2"
 
         q_match = re.search(r"([1-6][.,][1-2])", caption)
         queue = q_match.group(1).replace(",", ".") if q_match else default_queue
@@ -1581,15 +2037,17 @@ def setup_routers(
                 exact_loc = next((l for l in locations if l.queue == queue), None)
                 if exact_loc:
                     loc = exact_loc
+                elif voe_locs:
+                    loc = voe_locs[0]
+                    suggest_switch_loc = loc
                 else:
                     loc = locations[0]
-                    suggest_switch_loc = loc
 
-            header_prefix = "📸✅ <b>Зображення графіка з @pat_voe_bot успішно розпізнано та збережено!</b>"
+            header_prefix = "📸✅ <b>Зображення графіка успішно розпізнано та збережено!</b>"
             if suggest_switch_loc is not None:
                 header_prefix += (
                     f"\n💡 <i>Розпізнаний графік відповідає черзі <b>{queue}</b> "
-                    f"(у локації «{suggest_switch_loc.label}» зараз встановлено <b>{suggest_switch_loc.queue}</b>).</i>"
+                    f"(у локації «{suggest_switch_loc.label}» зараз встановлено <b>{suggest_switch_loc.queue_code}</b>).</i>"
                 )
 
             text = format_schedule_message(
@@ -1608,7 +2066,7 @@ def setup_routers(
         except Exception as exc:
             logger.exception("Failed to parse user photo: %s", exc)
             await message.answer(
-                "⚠️ Не вдалося розпізнати таблицю на зображенні. Переконайтеся, що це оригінальна картинка графіка з @pat_voe_bot."
+                "⚠️ Не вдалося розпізнати таблицю на зображенні. Переконайтеся, що на картинці чітко видно 24-годинну сітку графіка."
             )
 
     return router
@@ -1619,7 +2077,7 @@ def _format_settings_text(user) -> str:
         "⚙️ <b>Налаштування сповіщень</b>\n\n"
         "Тут ви можете гнучко налаштувати, які саме сповіщення отримувати:\n"
         "• <b>Графік на завтра</b> — сповіщення, коли ввечері публікується розклад на наступний день.\n"
-        "• <b>Зміни в графіку</b> — сповіщення, якщо обленерго оперативно змінило години відключень.\n"
+        "• <b>Зміни в графіку</b> — сповіщення, якщо оперативно змінилися години відключень.\n"
         "• <b>За 15 хв до вимкнення / увімкнення</b> — завчасне попередження перед кожним слотом.\n"
         "• <b>Можливі (жовті 🟡) слоти</b> — враховувати заплановані (жовті) слоти нарівні з підтвердженими (синіми/червоними 🔴).\n"
         "• <b>Тихі години</b> — не турбувати 15-хвилинними сповіщеннями вночі."
