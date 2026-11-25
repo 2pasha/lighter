@@ -143,10 +143,9 @@ class TestSvitloBotCore(unittest.TestCase):
             address_str="м. Вінниця, вул. Соборна, 10",
             now=datetime(2026, 11, 4, 7, 45, tzinfo=ZoneInfo("Europe/Kyiv")),
         )
-        self.assertIn("Черга: <b>3.2</b>", msg)
-        self.assertIn("📊 <b>Всього без світла:</b> 3 год", msg)
-        self.assertIn("🔴 підтверджених: 2 год", msg)
-        self.assertIn("🟡 можливих: 1 год", msg)
+        self.assertIn("Черга <b>3.2</b>", msg)
+        self.assertIn("🟢 <b>Зараз є світло</b> · вимкнуть о <b>08:00</b> (через 15 хв)", msg)
+        self.assertIn("📊 Без світла за добу: <b>3 год</b> <i>(🔴 2 год · 🟡 1 год)</i>", msg)
 
     def test_schedule_change_in_past_and_cancellation(self) -> None:
         """
@@ -195,8 +194,8 @@ class TestSvitloBotCore(unittest.TestCase):
             )
             diff = format_schedule_diff(s_with_outage, s_cancelled, now=test_time)
             self.assertIn("20:00–22:00", diff)
-            self.assertIn("Скасовано відключення", diff)
-            self.assertIn("зменшився на <b>2 год</b>", diff)
+            self.assertIn("Скасували:", diff)
+            self.assertIn("<b>−2 год</b>", diff)
 
     def test_outage_end_calculation_for_15min_warning(self) -> None:
         # Якщо о 07:45 попередження про відключення з 08:00 до 12:00 (слоти 16..23)

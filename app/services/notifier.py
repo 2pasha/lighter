@@ -530,10 +530,6 @@ class NotificationEngine:
         already_sent = await self.db.get_sent_alerts_for_keys([alert_key])
         eligible: list[tuple[UserProfile, UserLocation, str]] = []
 
-        header = f"🔄⚠️ <b>Оновлено графік відключень на {day_word}!</b>"
-        if diff_block:
-            header += f"\n{diff_block}"
-
         for user, loc in subs:
             if not user.notify_changes:
                 continue
@@ -544,13 +540,13 @@ class NotificationEngine:
             if (user.telegram_id, loc.id, alert_key) in already_sent:
                 continue
 
-            text = format_schedule_message(
-                schedule=new_sched,
-                location_label=loc.label,
-                address_str=loc.display_address,
-                now=now,
-                header_prefix=header,
-            )
+            text_lines = [
+                f"🔄 <b>Графік на {day_word} змінився</b> · {loc.label} ({new_sched.queue_code})"
+            ]
+            if diff_block:
+                text_lines.append("")
+                text_lines.append(diff_block)
+            text = "\n".join(text_lines)
             eligible.append((user, loc, text))
 
         if not eligible:
@@ -677,11 +673,6 @@ class NotificationEngine:
 
             q_code = loc.queue_code
             safe_loc_q = loc.queue.replace(":", "_")
-            addr_suffix = (
-                f" ({loc.display_address})"
-                if loc.display_address != f"Черга {q_code}"
-                else f" ({loc.region_short_label})"
-            )
 
             if not was_off and will_be_off and user.notify_15m_off:
                 # Подія №3: За 15 хвилин вимкнуть світло!
@@ -692,19 +683,21 @@ class NotificationEngine:
                         target_slot_idx,
                         user.notify_possible,
                     )
-                    outage_type_str = (
-                        "🔴 <b>Підтверджене відключення</b>"
-                        if next_state == SlotState.OFF
-                        else "🟡 <b>Заплановане (можливе) відключення</b>"
-                    )
+                    if next_state == SlotState.OFF:
+                        title = (
+                            f"🔌 <b>За 15 хвилин вимкнуть світло</b> — "
+                            f"<b>{loc.label}</b> (черга {q_code} · {loc.region_short_label})"
+                        )
+                    else:
+                        title = (
+                            f"🟡 <b>За 15 хвилин можливе відключення</b> — "
+                            f"<b>{loc.label}</b> (черга {q_code} · {loc.region_short_label})"
+                        )
                     msg = (
-                        f"⚠️🔌 <b>Увага! Відключення світла через 15 хвилин (о {target_time_str})</b>\n\n"
-                        f"📍 Локація: <b>{loc.label}</b>{addr_suffix}\n"
-                        f"🗺 Область: <b>{loc.region_label}</b>\n"
-                        f"🔢 Черга: <b>{q_code}</b>\n"
-                        f"📌 Статус слоту: {outage_type_str}\n"
-                        f"🕒 Орієнтовно до: <b>{end_str}</b> (тривалість: {duration_str})\n\n"
-                        f"<i>Рекомендуємо зарядити пристрої та завершити важливі справи за комп'ютером.</i>"
+                        f"{title}\n\n"
+                        f"Вимкнення о <b>{target_time_str}</b>, повернуть орієнтовно о <b>{end_str}</b> "
+                        f"<i>(на {duration_str})</i>.\n"
+                        f"<i>Встигніть зберегти роботу та поставити все на зарядку</i> 🔋"
                     )
                     img_bytes = (
                         img_off_confirmed
@@ -728,12 +721,14 @@ class NotificationEngine:
                     next_off_str = self._calc_light_until(
                         sched_target, target_slot_idx, user.notify_possible
                     )
+                    if next_off_str.startswith("о "):
+                        tail = f"Наступне відключення {next_off_str} 🟢"
+                    else:
+                        tail = "До кінця доби відключень більше не заплановано 🟢"
                     msg = (
-                        f"💡🎉 <b>Світло має з'явитися через 15 хвилин (о {target_time_str})!</b>\n\n"
-                        f"📍 Локація: <b>{loc.label}</b>{addr_suffix}\n"
-                        f"🗺 Область: <b>{loc.region_label}</b>\n"
-                        f"🔢 Черга: <b>{q_code}</b>\n"
-                        f"🟢 Наступне відключення: <b>{next_off_str}</b>"
+                        f"💡 <b>Ще 15 хвилин — і буде світло!</b> "
+                        f"<i>({loc.label}, черга {q_code} · {loc.region_short_label})</i>\n\n"
+                        f"Увімкнення за графіком о <b>{target_time_str}</b>. {tail}"
                     )
                     pending_alerts.append(
                         (
@@ -840,7 +835,7 @@ class NotificationEngine:
             if is_off:
                 mins = idx * 30
                 h, m = divmod(mins, 60)
-                return f"о {h:02d}:{m:02d} ({st.emoji})"
+                return f"о <b>{h:02d}:{m:02d}</b>"
         return "до кінця доби не заплановано ✅"
 
     async def _send_schedule_notification(

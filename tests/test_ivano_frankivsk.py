@@ -252,8 +252,8 @@ async def test_multi_region_coexistence_db_notifier_formatter_and_widget() -> No
             address_str=loc_kolomyia.display_address,
             now=now,
         )
-        assert "Івано-Франківська область" in msg_if
-        assert "Черга: <b>4.1</b>" in msg_if
+        assert "Івано-Франківська обл." in msg_if
+        assert "Черга <b>4.1</b>" in msg_if
         assert "if:4.1" not in msg_if
 
         png_if = render_schedule_image(sched_if, scale=1, now=now)
@@ -269,11 +269,11 @@ async def test_multi_region_coexistence_db_notifier_formatter_and_widget() -> No
 
         assert bot.send_photo.call_count == 1
         sent_caption = bot.send_photo.call_args.kwargs.get("caption", "")
-        assert "м. Коломия" in sent_caption
-        assert "Івано-Франківська область" in sent_caption
-        assert "Черга: <b>4.1</b>" in sent_caption
+        assert "🏠 Квартира" in sent_caption
+        assert "Івано-Франківська обл." in sent_caption
+        assert "черга 4.1" in sent_caption
         assert "if:4.1" not in sent_caption
-        assert "м. Вінниця" not in sent_caption
+        assert "Вінницька" not in sent_caption
 
         # Перевіряємо роботу iOS Scriptable віджета для обох локацій
         w_kol = await resolve_widget_data(

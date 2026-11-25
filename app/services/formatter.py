@@ -38,6 +38,12 @@ def format_date_ua(d: date) -> str:
     return f"{d.day} {month} ({weekday}, {d.strftime('%d.%m.%Y')})"
 
 
+def format_date_short_ua(d: date) -> str:
+    weekday = WEEKDAYS_UA.get(d.weekday(), "")
+    month = MONTHS_UA.get(d.month, "")
+    return f"{weekday}, {d.day} {month}"
+
+
 def format_minutes_human(total_minutes: int) -> str:
     hours, mins = divmod(max(0, total_minutes), 60)
     parts = []
@@ -56,7 +62,7 @@ def format_schedule_message(
     header_prefix: Optional[str] = None,
 ) -> str:
     """
-    Формує детальне, легко читабельне повідомлення з графіком відключень українською мовою.
+    Формує лаконічне, легко читабельне повідомлення з графіком відключень українською мовою.
     """
     lines: list[str] = []
 
@@ -65,37 +71,38 @@ def format_schedule_message(
         lines.append("")
 
     q_code = schedule.queue_code
-    loc_title = f"📍 <b>{location_label}</b>" if location_label else f"⚡ <b>Черга {q_code}</b>"
-    if address_str and address_str not in (f"Черга {q_code}", f"Черга {schedule.queue}"):
-        loc_title += f" ({address_str})"
+    region_short = get_region_label(schedule.region, short=True)
+    if location_label:
+        loc_title = f"📍 <b>{location_label}</b> · Черга <b>{q_code}</b> · {region_short}"
+    else:
+        loc_title = f"⚡ <b>Черга {q_code}</b> · {region_short}"
     lines.append(loc_title)
-    lines.append(f"🗺 Область: <b>{get_region_label(schedule.region)}</b>")
-    lines.append(f"🔢 Черга: <b>{q_code}</b>")
-    lines.append(f"📅 Дата: <b>{format_date_ua(schedule.schedule_date)}</b>")
+    lines.append(f"📅 {format_date_short_ua(schedule.schedule_date)}")
     lines.append("")
 
     # Якщо це графік на сьогодні, показуємо поточний статус світла просто зараз
     if now and now.date() == schedule.schedule_date:
         cur_min = now.hour * 60 + now.minute
-        cur_state = schedule.state_at_minute(cur_min)
-        next_change_str = _describe_next_transition(schedule, cur_min)
-        lines.append(f"⏱ <b>Статус зараз ({now.strftime('%H:%M')}):</b> {cur_state.emoji} {cur_state.label_ua}")
-        if next_change_str:
-            lines.append(f"   └ {next_change_str}")
+        lines.append(_describe_current_and_next(schedule, cur_min))
         lines.append("")
 
     if schedule.total_outage_minutes == 0:
-        lines.append("🎉 <b>Відключень не заплановано! Світло має бути цілу добу.</b>")
-        lines.append("")
+        lines.append("🎉 <b>Відключень не заплановано!</b> Світло має бути цілу добу.")
+        return "\n".join(lines)
 
     total_off = format_minutes_human(schedule.total_outage_minutes)
-    conf_off = format_minutes_human(schedule.confirmed_outage_minutes)
-    poss_off = format_minutes_human(schedule.possible_outage_minutes)
-    lines.append(
-        f"📊 <b>Всього без світла:</b> {total_off}\n"
-        f"🔴 підтверджених: {conf_off}\n"
-        f"🟡 можливих: {poss_off}"
-    )
+    breakdown_parts: list[str] = []
+    if schedule.confirmed_outage_minutes > 0:
+        breakdown_parts.append(f"🔴 {format_minutes_human(schedule.confirmed_outage_minutes)}")
+    if schedule.possible_outage_minutes > 0:
+        breakdown_parts.append(f"🟡 {format_minutes_human(schedule.possible_outage_minutes)}")
+
+    if breakdown_parts:
+        lines.append(
+            f"📊 Без світла за добу: <b>{total_off}</b> <i>({' · '.join(breakdown_parts)})</i>"
+        )
+    else:
+        lines.append(f"📊 Без світла за добу: <b>{total_off}</b>")
     return "\n".join(lines)
 
 
@@ -145,23 +152,22 @@ def format_schedule_diff(
 
     diff_lines: list[str] = []
     if removed_ranges:
-        diff_lines.append(
-            "🟢 <b>Скасовано відключення (буде світло):</b> " + ", ".join(removed_ranges)
-        )
+        diff_lines.append("🟢 Скасували: " + ", ".join(removed_ranges))
     if added_ranges:
-        diff_lines.append(
-            "🔴 <b>Додано відключення:</b> " + ", ".join(added_ranges)
-        )
+        diff_lines.append("🔴 Додали: " + ", ".join(added_ranges))
 
     delta = added_mins - removed_mins
+    total_new = format_minutes_human(new_sched.total_outage_minutes)
     if delta > 0:
         diff_lines.append(
-            f"📈 Час без світла збільшився на <b>{format_minutes_human(delta)}</b>"
+            f"📈 Разом: <b>+{format_minutes_human(delta)}</b> без світла (всього <b>{total_new}</b>)"
         )
     elif delta < 0:
         diff_lines.append(
-            f"📉 Час без світла зменшився на <b>{format_minutes_human(-delta)}</b> 🎉"
+            f"📉 Разом: <b>−{format_minutes_human(-delta)}</b> без світла (всього <b>{total_new}</b>)"
         )
+    elif removed_ranges or added_ranges:
+        diff_lines.append(f"📊 Всього без світла: <b>{total_new}</b>")
 
     return "\n".join(diff_lines)
 
@@ -191,9 +197,17 @@ def _slot_range_str(start_idx: int, end_idx: int) -> str:
     return f"<b>{sh:02d}:{sm:02d}–{end_s}</b> ({dur})"
 
 
-def _describe_next_transition(schedule: DaySchedule, cur_minute: int) -> str:
+def _describe_current_and_next(schedule: DaySchedule, cur_minute: int) -> str:
     cur_slot_idx = max(0, min(47, cur_minute // 30))
-    cur_is_outage = schedule.slots[cur_slot_idx].is_outage
+    cur_state = schedule.slots[cur_slot_idx]
+    cur_is_outage = cur_state.is_outage
+
+    if cur_state == SlotState.ON:
+        head = "🟢 <b>Зараз є світло</b>"
+    elif cur_state == SlotState.OFF:
+        head = "🔴 <b>Зараз без світла</b>"
+    else:
+        head = "🟡 <b>Можливе відключення</b>"
 
     for idx in range(cur_slot_idx + 1, 48):
         slot_state = schedule.slots[idx]
@@ -203,11 +217,10 @@ def _describe_next_transition(schedule: DaySchedule, cur_minute: int) -> str:
             h, m = divmod(target_min, 60)
             time_str = f"{h:02d}:{m:02d}"
             if cur_is_outage:
-                return f"💡 Очікується відновлення о <b>{time_str}</b> (через {format_minutes_human(diff)})"
-            else:
-                return f"⚠️ Наступне відключення о <b>{time_str}</b> ({slot_state.emoji}, через {format_minutes_human(diff)})"
+                return f"{head} · увімкнуть о <b>{time_str}</b> (через {format_minutes_human(diff)})"
+            return f"{head} · вимкнуть о <b>{time_str}</b> (через {format_minutes_human(diff)})"
 
     if cur_is_outage:
         diff = 1440 - cur_minute
-        return f"💡 До кінця доби відключення триває (ще {format_minutes_human(diff)})"
-    return "✅ До кінця доби відключень більше немає"
+        return f"{head} · до кінця доби (ще {format_minutes_human(diff)})"
+    return f"{head} · до кінця доби без відключень"
